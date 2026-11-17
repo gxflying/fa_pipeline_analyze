@@ -10,6 +10,34 @@
 | Vector 的 LD/ST 要多快？ | 假设独立引擎经共享 SRAM 交接 S/P，Vector 读 S **1.00 TB/s**、写 P **0.50 TB/s**。两端都计，SRAM 为此服务 **3.00 TB/s**。本例 vLLM FA2 通过寄存器 fragment 交付 S/P。若旧输出也通过 SRAM 交给 Vector 重标并送回，Vector 读、写每方向再加 **0.969 TB/s**。 |
 | 换成 decode 还需要这组带宽吗？ | 单 token、GQA 每份 KV 供 4 个头复用时，BF16 的理想 KV 算术强度降到 **4 有效 FLOP/B**。512 GB/s 的冷 KV 源带宽最多支撑 **2.048 有效 TFLOP/s**。矩形填充、split 与有效吞吐应分别计算。 |
 
+## 模型前提、参数与计算式
+
+**适用范围。** 主算例固定 vLLM v0.11.2、单 GPU、分页 FA2、因果 decoder 前向、单分区。只计从已就位的 Q/K/V 到 O 和 LSE 的核心计算。QKV 投影、RoPE、cache 追加和输出投影单独计费。关闭 dropout、softcap、额外 bias、滑窗与 cascade。[版本及内核分派](kernel_sources.md)
+
+**执行假定。** QK 和 PV 共用同一 Tensor 阵列，一个 MAC 计 2 FLOP。Vector 按独立 MUL、ADD/SUB、二元归约和指数计数，每行每个非首块计算一份重标系数并广播。旧输出经缩放后直接作为 PV 的累加输入，末块结束才做最终归一化。带宽按单份有效载荷计，Q 跨 KV 块驻留，K/V 在一个 Q 块内复用，外存示例假定跨 CTA 冷读。S/P 经共享 SRAM 是独立双引擎设计假设，核对的 FA2 使用寄存器 fragment。吞吐预算假定有足够独立工作，使用可持续矩阵速率；单 CTA 延迟与瞬时峰值另行核算。
+
+| 参数 | 含义 | 主算例 |
+|---|---|---|
+| $p,q,L$ | 已缓存前缀、本轮新增 query 数、最终 KV 长度，$L=p+q$ | 4032、64、4096 token |
+| $H_q,H_{kv},G$ | Q/KV 头数、组头比 $G=H_q/H_{kv}$ | 预算按一个 Q 头，无跨头复用 |
+| $d_k,d_v,s$ | Q/K 头维、V 头维、score 缩放 $s=1/\sqrt{d_k}$ | 128、128、$1/\sqrt{128}$ |
+| $M,N,P_{\rm page},T$ | Q 块行数、KV 计算块宽、cache 页长、该 Q 块扫描的 KV 块数 | 64、128、16、32 |
+| $b_Q,b_K,b_V,b_P,b_O$；$b_S,b_U$ | Q/K/V、PV 输入与最终 O 的字节数；score 与未归一化累加器的字节数 | 前五项 2 B，后两项 4 B，行统计量 FP32 |
+| $m_{\rm reuse},T_Q$ | 指定存储边界上一份 KV 服务的行数、一份 Q 装入后服务的 KV 块数 | KV 供 64 行；Q 源端取 32，逐块装填端取 1 |
+| $P_T,C_i,B_e$ | Tensor 持续 FLOP/s、Vector 单元 $i$ 的服务率、接口 $e$ 的有效 B/s | Tensor 目标 128 TFLOP/s，冷外存例取 512 GB/s，Vector 需求由下式反推 |
+
+**从请求得到计数。** 单头的因果有效配对为 $A_{\rm valid}=pq+q(q+1)/2$。对实际发射的每个矩形块 $b$，记执行行、列数为 $M_b,N_b$（包含发射的填充槽），则 $A=\sum_b M_bN_b$ 为执行槽数，$J=\sum_b M_b$ 为行块访问数，$R$ 为各独立扫描首次处理的执行行总数，$H=J-R$ 为非首块行访问数。本例 $A_{\rm valid}=260128$，而 $A=MTN=262144,\ J=MT=2048,\ R=M=64,\ H=1984$。
+
+| 工作量 | 数学表达 |
+|---|---|
+| Tensor FLOP | $F_{QK}=2Ad_k,\quad F_{PV}=2Ad_v,\quad F_T=2A(d_k+d_v)$ |
+| Vector 乘、加减 | $W_{\rm MUL}=A+H+d_vJ,\quad W_{\rm ADD/SUB}=A+2H$ |
+| Vector 归约和指数 | $W_{\rm REDMAX}=W_{\rm REDSUM}=A-J$（各按二元操作），$W_{\rm MAX合并}=H,\quad W_{\rm EXP}=A+H$ |
+| 收尾与转换 | RCP、LSE 的 LOG 和 ADD 各 $R$ 次。P 转换 $A$ 次，最终 O 转换为有效输出行数乘 $d_v$ |
+| 时间、所需吞吐和算力比 | $t_T=F_T/P_T,\quad x=A/t_T,\quad C_{i,\rm req}=W_i/t_T,\quad \text{Tensor∶Vector}_i=(F_T/W_i)∶1$（FLOP∶元素操作） |
+
+**从算力得到带宽。** 在满 tile 的稳态下，Q、K、V 各自所需的读带宽为 $x b_Qd_k/(NT_Q)$、$x b_Kd_k/m_{\rm reuse}$、$x b_Vd_v/m_{\rm reuse}$。S/P 各交接一次时，Tensor 写 S 与 Vector 读 S 均需 $xb_S$，Vector 写 P 与 Tensor 读 P 均需 $xb_P$。因此仅计该交接的两侧读口比为 $b_P∶b_S$，写口比为 $b_S∶b_P$。若旧输出经 Vector 重标再回送，每方向另需 $b_Ud_vH/t_T$。对任意接口按 $B_{e,\rm req}=D_e/t_T$ 折算，$D_e$ 只累计穿过该接口的字节。满足这些平均需求是持续喂满 Tensor 的必要条件，实际还需满足依赖、容量和端口突发要求。
+
 ## 1. 从标准 attention 到逐块在线计算
 
 对一个 Q 头，标准前向为 $O=\mathrm{softmax}(sQK^\top+\mathrm{mask})V$，通常 $s=1/\sqrt{d_k}$。GQA 中多个 Q 头映射到同一个 KV 头，每个 Q 头仍有自己的 softmax。以 vLLM 的 Qwen2 为例，整层按 QKV 投影 → 拆出 Q/K/V → Q/K 做 RoPE → attention → 输出投影执行。两侧投影也属于 Tensor 工作，RoPE 包含逐元素乘加，cache 追加包含 slot 映射和 K/V 读写。下面的配比以 attention 核的 Q、已就位的 KV cache 为输入，cache 追加单列在第 4 节。这样可以分别估算 attention 核与整层时间。[vLLM Qwen2Attention.forward](https://github.com/vllm-project/vllm/blob/275de34170654274616082721348b7edd9741d32/vllm/model_executor/models/qwen2.py) · [vLLM cache 更新及 attention 调用](kernel_sources.md)

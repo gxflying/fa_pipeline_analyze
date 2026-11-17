@@ -1,0 +1,766 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>FlashAttention · 数据流与资源配比</title>
+<style>
+:root{--ink:#152e30;--sub:#546b68;--line:#cfdbd5;--paper:#f4f6f1;--teal:#006757;--mint:#d7eee4;--gold:#b06a14;--violet:#6b4993;--blue:#315f8a}*{box-sizing:border-box}body{margin:0;background:var(--paper);color:var(--ink);font:14px/1.55 "Inter","Microsoft YaHei UI","PingFang SC",sans-serif}button,input,select{font:inherit;color:inherit}button,select{cursor:pointer}a{color:var(--teal)}button{border:1px solid var(--line);border-radius:6px;background:white;padding:6px 12px}button:hover,button:focus-visible{border-color:var(--teal)}button:disabled{opacity:.48;cursor:default}header{background:#163c36;color:#fff;padding:13px clamp(16px,3vw,55px);display:flex;align-items:center;justify-content:space-between;gap:12px}header strong{font:600 18px/1.4 "IBM Plex Mono",monospace;letter-spacing:-.6px}header strong i{display:inline-block;width:14px;height:14px;background:#99e7b6;box-shadow:4px -4px 0 #55977e;margin-right:12px}nav{display:flex;gap:20px}nav a{color:#e1eee5;text-decoration:none;font-size:13px}main{max-width:1700px;margin:auto;padding:24px clamp(12px,2.6vw,48px) 60px}.titleline,.bar,.tools,.controls{display:flex;align-items:center;gap:10px;flex-wrap:wrap}.titleline,.bar{justify-content:space-between}h1,h2,h3,p{margin:0}h1{font-size:clamp(25px,3vw,42px);line-height:1.24;letter-spacing:-1.3px}h2{font-size:21px;letter-spacing:-.5px}h3{font-size:16px}.titleline p,.hint,small{color:var(--sub)}.titleline p{margin:6px 0 18px}.shell{display:grid;grid-template-columns:240px minmax(0,1fr);gap:18px;align-items:start}.side,.panel,.metrics{background:#fff;border:1px solid var(--line);border-radius:12px}.side{padding:16px;position:sticky;top:10px;max-height:calc(100vh - 20px);overflow:auto;scrollbar-width:thin}.side h2{font-size:17px}.side details{border-top:1px solid var(--line);margin-top:13px;padding-top:9px}summary{cursor:pointer;font-weight:650}.fields{display:grid;grid-template-columns:1fr 1fr;gap:9px 7px;margin-top:9px}label{font-size:12px;color:var(--sub);display:block}input[type=number],select{width:100%;padding:5px 6px;background:#f6f8f5;border:1px solid #c8d6cf;border-radius:5px;font-variant-numeric:tabular-nums}input:invalid{outline:2px solid #bc4b32}.wide{grid-column:1/-1}.side .tools{margin-top:14px}.side .tools button{font-size:12px;flex:1;padding:6px}.metrics{display:grid;grid-template-columns:repeat(4,1fr);overflow:hidden}.metric{padding:14px 16px;border-right:1px solid var(--line)}.metric:last-child{border-right:0}.metric b,.num{font-family:"IBM Plex Mono",Consolas,monospace;font-variant-numeric:tabular-nums}.metric b{display:block;color:var(--teal);font-size:clamp(20px,2.3vw,34px);line-height:1.35}.metric span,.metric small{font-size:12px}.panel{padding:17px 20px;margin-top:14px}.panel p{margin:6px 0}.tileview{display:grid;grid-template-columns:minmax(190px,1fr) minmax(240px,1.4fr);gap:18px;align-items:center;margin-top:10px}.matrixwrap{background:#edf3ec;border-radius:8px;padding:8px 12px}.matrixwrap canvas{width:100%;height:86px;display:block}.loopgrid{display:grid;grid-template-columns:repeat(3,1fr);gap:6px}.loopgrid input{width:100%;accent-color:var(--teal)}.controls button{font-size:12px}.controls{margin-top:7px}.pill{background:#e9f2ec;color:var(--teal);border-radius:5px;padding:3px 7px;font:12px/1.6 Consolas,monospace}.legend{display:flex;gap:12px;align-items:center;flex-wrap:wrap;color:var(--sub);font-size:12px}.legend span:before{content:"";display:inline-block;border-radius:2px;width:8px;height:8px;margin-right:4px;background:var(--c)}.graphscroll{overflow:auto;margin:8px -5px 0}.graph{display:block;min-width:700px;width:100%;height:auto}.graph .node{cursor:pointer}.graph text{font-family:"Microsoft YaHei UI",sans-serif;pointer-events:none}.graph .node:focus rect,.graph .node:hover rect{stroke-width:2}.focusbox{border-left:3px solid var(--teal);background:#f1f6f2;padding:9px 13px;margin-top:4px}.focusbox button{font-size:12px;padding:1px 6px;margin:2px}.focusbox .num{font-size:14px}.twocol{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.scroll{overflow:auto}table{width:100%;border-collapse:collapse;margin-top:9px;font-size:13px}th,td{padding:7px 8px;text-align:right;border-bottom:1px solid #e2e9e3;white-space:nowrap;font-variant-numeric:tabular-nums}th{color:var(--sub);font-weight:550;background:#f4f7f3}th:first-child,td:first-child{text-align:left}.summary{background:#eef4ef;border-radius:6px;padding:9px 12px}.neg{color:#a44a2e}.pos{color:var(--teal)}#err{color:#a13722}.links{display:flex;gap:18px;flex-wrap:wrap}section{scroll-margin-top:10px}.hint{font-size:12px}.banner{font-size:12px;color:#566d63;margin-top:8px}.mode{border:1px solid #88a99b;border-radius:24px;color:#375c4b;padding:4px 10px}.compact{font-size:12px}footer{margin-top:16px;color:var(--sub)}@media(max-width:960px){.shell{grid-template-columns:200px minmax(0,1fr)}.twocol,.tileview{grid-template-columns:1fr}.metric{padding:10px}.panel{padding:14px}}@media(max-width:700px){.shell{display:flex;flex-direction:column}.side{position:static;width:100%;max-height:340px}.content{width:100%}.metrics{grid-template-columns:1fr 1fr}header nav{gap:8px}.titleline p{margin-bottom:8px}.shell{gap:10px}.side .fields{grid-template-columns:repeat(3,1fr)}main{padding-top:15px}.twocol{display:block}}
+</style></head><body>
+<header><strong><i></i>FlashAttention</strong><nav><a href="#flow">数据流</a><a href="#resources">资源配比</a><a href="#notes">模型口径</a></nav></header>
+<main><div class="titleline"><div><h1>FlashAttention 数据流与资源配比</h1><p>逐块查看 QK、在线 softmax 与 PV 累加，改变分块和数据驻留方式，比较整层的算力与带宽需求。</p></div><span class="mode" id="mode"></span></div>
+<div class="shell"><aside class="side"><h2>模型参数</h2><label>载入配置<select id="preset"><option value="base">分页 FA2 · 因果 prefill</option><option value="decode">单 token · GQA decode</option><option value="short">首次 prefill · 因果边界</option><option value="custom" disabled>自定义</option></select></label><div id="settings"></div><div class="tools"><button id="pin">设为对照</button><button id="reset">恢复默认</button></div><p class="hint" id="ref"></p><p id="err" role="alert"></p></aside>
+<div class="content"><section class="metrics" id="metrics"></section>
+<section id="flow" class="panel"><div class="bar"><h2>FlashAttention 执行流水线</h2><span class="pill" id="loopid"></span></div>
+<div id="loop"><div class="loopgrid" id="sliders"></div><div class="controls"><button id="prev">← 上一块</button><button id="play">播放</button><button id="next">下一块 →</button><span id="tilenote" class="hint"></span></div></div>
+<div class="maptools"><div class="legend"><span style="--c:#087260">Tensor</span><span style="--c:#705093">Vector</span><span style="--c:#41678a">DMA</span><span style="--c:#ad701a">Control</span></div><div class="controls"><button id="detail" aria-pressed="false">展开全部 IR</button><button id="less" aria-label="缩小流水线">−</button><button id="fit">适应宽度</button><button id="more" aria-label="放大流水线">＋</button><button id="wide">放大画布</button></div></div>
+<p class="hint">实线表示本块数据或就绪事件，橙色虚线表示跨迭代依赖。网格示意块形状，标注给出实际维度。点击矩阵块可跳转扫描位置，点击操作框可查看指令，再次点击可就地展开。</p>
+<div class="graphscroll"><svg id="graph" class="graph" role="group" aria-label="Q、K、V 矩阵分块、完整流水线和循环依赖"></svg></div><div id="focus" class="focusbox"></div></section>
+<section class="panel" id="resources"><div class="bar"><h2>复用与分块</h2><span class="pill" id="scope"></span></div><div class="scroll" id="reuse"></div><p class="hint" id="capacity"></p></section>
+<section class="panel"><h2>执行单元配比</h2><p class="hint">按整个工作量除以 Tensor 服务时间。调整右侧供给可检查单元的服务下界；Δ 取当前值减对照值。</p><div class="scroll" id="compute"></div></section>
+<section class="panel"><h2>读写带宽</h2><p class="hint">各行是指定存储边界的有效载荷。目标 GB/s 按同一个 Tensor 时间折算；同一数据经过不同接口时分别列账。</p><div class="scroll" id="band"></div><p id="ratio" class="summary"></p></section>
+<section class="panel"><h2>资源时间下界</h2><div class="scroll" id="limits"></div><p class="summary" id="bottleneck"></p></section>
+<section class="panel" id="notes"><h2>模型口径</h2><div id="assumptions"></div><div class="links"><a href="README.md">完整数学模型</a><a href="kernel_sources.md">固定版本源码对照</a><a href="attention_balance.py">Python 参考模型</a></div></section></div></div></main>
+<script>
+"use strict";
+const el=id=>document.getElementById(id);
+const num=(v,n=2)=>Number(v).toLocaleString("en-US",{maximumFractionDigits:n});
+const bytes=v=>v>=1048576?num(v/1048576,3)+" MiB":v>=1024?num(v/1024,3)+" KiB":num(v)+" B";
+const clamp=(v,min,max)=>Math.max(min,Math.min(max,v));
+const ceil=Math.ceil;
+const fields=[
+["请求与分块",[
+["q","本轮 Q token",64,1,4096],["p","历史 KV token",4032,0,131072],["dk","Q/K 头维",128,8,1024],["dv","V 头维",128,8,1024],["m","Q 块行数 M",64,[16,32,64,128,256]],["n","KV 块宽 N","auto",["auto|FA2 自动",16,32,64,128,256]],["hq","Q 头数",1,1,256],["hk","KV 头数",1,1,256],["page","cache 页长",16,[8,16,32,64,128,256]],["causal","可见范围","yes",["yes|因果","no|全可见"]],["pack","同组 Q 头","auto",["auto|单 token 打包","yes|总是打包","no|分别扫描"]],["split","最大 KV 分区",1,[1,2,4,8,16]]]],
+["精度与驻留",[
+["bq","Q 字节",2,[1,2,4]],["bk","K 字节",2,[1,2,4]],["bv","V 字节",2,[1,2,4]],["bp","P 字节",2,[1,2,4]],["bo","O 字节",2,[1,2,4]],["qstay","源端 Q 驻留","keep",["keep|每分区装一次","load|每 KV 块重装"]],["qfeed","阵列 Q 装填","load",["load|每 KV 块装一次","keep|每分区保留"]],["hit","重复 KV 命中 %",0,0,100],["bridge","S/P 交接","sram",["sram|共享 SRAM","direct|寄存器 / 直连"]],["reread","Vector 读 S","1",["1|保留，一次读","2|重扫，两次读"]],["uplace","旧 U 重标","rf",["rf|共享 RF · Vector","sram|SRAM 往返 · Vector","tensor|累加器端行乘"]],["hs","QK 内积切片","full",["full|整条头维",16,32,64,128,256]],["spill","QK 部分和","keep",["keep|阵列内保留","sram|切片间经 SRAM"]]]],
+["硬件供给",[
+["pt","Tensor TFLOP/s",128,1,4096],["dram","外存 GB/s",512,1,32000],["sr","SRAM 读 GB/s",8000,1,128000],["sw","SRAM 写 GB/s",8000,1,128000],["cap","片上预算 KiB",512,1,16384],["buffers","KV 缓冲份数",2,[1,2,3,4]]]]
+];
+const base=Object.fromEntries(fields.flatMap(g=>g[1].map(f=>[f[0],f[2]])));
+const configs={base,decode:{...base,q:1,p:4095,hq:4},short:{...base,q:256,p:0}};
+let cfg={...base}, saved={...base}, savedName="默认 prefill", outer=0, part=0, step=0, selected="qk",timer=null;
+const unitCaps={MUL:1000,"ADD/SUB":1000,REDMAX:500,REDSUM:500,MAX:500,EXP:250,RCP:125,LOG:125,CVT:1000,SELECT:1000,"行乘":1000};
+function makeSettings(){
+ const root=el("settings");
+ for(const [i,[name,fs]] of fields.entries()){
+  const group=document.createElement("details");group.open=i===0;group.innerHTML="<summary>"+name+"</summary>";
+  const div=document.createElement("div");div.className="fields";
+  for(const [id,label,def,min,max] of fs){
+   const lab=document.createElement("label");lab.textContent=label;
+   const opt=Array.isArray(min), input=document.createElement(opt?"select":"input");input.id=id;
+   if(opt){for(const val of min){const [key,title]=String(val).split("|");input.add(new Option(title||key,key))}}
+   else{input.type="number";input.min=min;input.max=max;input.step=1;input.required=true}
+   lab.append(input);div.append(lab);input.addEventListener("input",readControls);
+  }group.append(div);root.append(group)
+ }
+ for(const [id,name] of [["outer","Q 块"],["part","KV 分区"],["step","扫描步"]]){
+  const wrap=document.createElement("label");wrap.innerHTML=name+' <b id="'+id+'Label"></b><input aria-label="'+name+'" type="range" min="0" value="0" id="'+id+'">';el("sliders").append(wrap);
+  el(id).oninput=()=>{stop();if(id==="outer"){outer=+el(id).value;part=step=0}else if(id==="part"){part=+el(id).value;step=0}else step=+el(id).value;render()}
+ }
+}
+function sync(){for(const [,fs] of fields)for(const [id] of fs)el(id).value=cfg[id]}
+function readControls(){
+ let next={};stop();
+ for(const [,fs] of fields)for(const [id,label,def,min] of fs){
+  const i=el(id);if(!i.checkValidity()){el("err").textContent="请检查「"+label+"」的取值范围。";return}
+  next[id]=typeof def==="number"?Number(i.value):i.value;
+ }
+ if(next.hq%next.hk){el("err").textContent="Q 头数须能被 KV 头数整除。";return}
+ el("err").textContent="";cfg=next;outer=part=step=0;el("preset").value="custom";render()
+}
+function geometry(c){
+ const n=c.n==="auto"?(c.dk<=64?256:c.dk<=128?128:64):+c.n,g=c.hq/c.hk;
+ const pack=c.pack==="yes"||(c.pack==="auto"&&c.q===1), factor=pack?g:1;
+ const copies=pack?c.hk:c.hq,L=c.p+c.q,blocks=[];
+ let A=0,J=0,R=0,H=0,kv=0,qsource=0,qfeed=0,partial=0,finalR=0,mergeR=0,validPart=0,partRows=0,masked=0,pages=0,scans=0,ctas=0;
+ for(let begin=0;begin<c.q*factor;begin+=c.m){
+  const end=Math.min(begin+c.m,c.q*factor),rows=end-begin,last=Math.floor((end-1)/factor);
+  const vis=c.causal==="yes"?c.p+last+1:L,count=ceil(vis/n),s=Math.min(+c.split,count);
+  const keys=Math.min(count*n,L),totalRows=rows*copies,visits=c.m*count*copies;
+  blocks.push({begin,end,rows,count,s,keys});
+  A+=visits*n;J+=visits;R+=c.m*copies*s;H+=visits-c.m*copies*s;kv+=keys*copies;
+  qsource+=totalRows*(c.qstay==="keep"?s:count);qfeed+=c.m*copies*(c.qfeed==="keep"?s:count);
+  scans+=count*copies;ctas+=s*copies;partRows+=c.m*copies*s;validPart+=totalRows*s;
+  finalR+=totalRows;if(s>1){mergeR+=totalRows;partial+=totalRows*s}
+  pages+=ceil(keys/c.page)*copies;
+  const firstVis=c.causal==="yes"?c.p+Math.floor(begin/factor)+1:L;
+  // Count issued score slots on tiles needing a column mask (excluding Q-row output predication).
+  masked+=(count-Math.floor(firstVis/n))*c.m*n*copies;
+ }
+ const valid=c.hq*(c.causal==="yes"?c.q*c.p+c.q*(c.q+1)/2:c.q*L);
+ return {n,g,pack,factor,copies,L,blocks,A,J,R,H,kv,qsource,qfeed,partial,finalR,mergeR,validPart,partRows,masked,pages,scans,ctas,valid}
+}
+function model(c){
+ const z=geometry(c),{A,J,R,H,partial,mergeR,validPart,finalR}=z;
+ const f=2*A*(c.dk+c.dv),t=f/(c.pt*1e6); // microseconds
+ const sliced=ceil(c.dk/(c.hs==="full"?c.dk:+c.hs)), mid=4*A*(sliced-1)*(c.spill==="sram");
+ const tensorScale=c.uplace==="tensor", forwarded=4*c.dv*H*(c.uplace==="sram");
+ const terminal=4*c.dv*R*(c.uplace==="sram"),coef=4*J*tensorScale;
+ const work={MUL:A+H+(tensorScale?0:J*c.dv)+partial*(1+c.dv),"ADD/SUB":A+2*H+R+partial+(partial-mergeR)*c.dv+mergeR,REDMAX:A-J+partial-mergeR,REDSUM:A-J+partial-mergeR,MAX:H,EXP:A+H+partial,RCP:R+mergeR,LOG:R+mergeR,CVT:A+finalR*c.dv,SELECT:z.masked,"行乘":tensorScale?J*c.dv:0};
+ const cold=z.L*c.hk, effective=cold+(z.kv-cold)*(1-c.hit/100);
+ const srcQ=z.qsource*c.dk*c.bq,srcK=effective*c.dk*c.bk,srcV=effective*c.dv*c.bv, O=finalR*c.dv*c.bo,lse=finalR*4,partIO=4*partial*(1+c.dv);
+ const feedQ=z.qfeed*c.dk*c.bq, feedK=z.scans*z.n*c.dk*c.bk,feedV=z.scans*z.n*c.dv*c.bv;
+ const sBytes=A*4,pBytes=A*c.bp,useSR=c.bridge==="sram",sRead=sBytes*Number(c.reread);
+ const tr=useSR?pBytes:0,tw=useSR?sBytes:0,vr=useSR?sRead:0,vw=useSR?pBytes:0;
+ const srR=feedQ+feedK+feedV+tr+vr+2*forwarded+terminal+mid;
+ const srW=srcQ+z.kv*(c.dk*c.bk+c.dv*c.bv)+tw+vw+2*forwarded+terminal+mid;
+ const traffic={
+ "源存储 · Q":[srcQ,0],"源存储 · K":[srcK,0],"源存储 · V":[srcV,0],"源存储 · O / LSE":[0,O+lse],"源存储 · split 部分 O / LSE":[partIO,partIO],
+ "阵列操作数 · Q":[feedQ,0],"阵列操作数 · K":[feedK,0],"阵列操作数 · V":[feedV,0],"阵列操作数 · P":[pBytes,0],
+ "S/P 交接 · Tensor":[tr,tw],"S/P 交接 · Vector":[vr,vw],"直连 / RF · Vector 读 S、交付 P":[useSR?0:sRead,useSR?0:pBytes],
+ "旧 U 往返与末块交付 · Vector":[forwarded+terminal,forwarded],"QK 切片 · 部分和 SRAM":[mid,mid],"累加器侧 · 行系数输入":[coef,0],"共享 SRAM 合计":[srR,srW]};
+ const dram=srcQ+srcK+srcV+O+lse+2*partIO;
+ const memUs=dram/(c.dram*1000);
+ const live=c.m*c.dk*c.bq+c.buffers*z.n*(c.dk*c.bk+c.dv*c.bv)+c.m*z.n*(4+c.bp)+4*c.m*c.dv+8*c.m;
+ return {z,f,t,work,traffic,dram,memUs,srR,srW,live,sliced,partIO,srcQ,feedQ,effReuse:z.valid/effective,ks:z.valid/z.kv,effBW:dram/t/1000}
+}
+</script>
+<script>
+fields[1][1].push(["lanes","Vector 每条 lane 数",16,[8,16,32,64]],["ma","MMA 原子 M",16,[8,16,32]],["na","MMA 原子 N",8,[8,16]],["ka","MMA 原子 K",16,[8,16,32]]);
+Object.assign(base,{lanes:16,ma:16,na:8,ka:16});
+Object.assign(configs.decode,{lanes:16,ma:16,na:8,ka:16});Object.assign(configs.short,{lanes:16,ma:16,na:8,ka:16});
+cfg={...base};saved={...base};
+const stages=["取址与搬运","QK 矩阵乘","行最大值","概率与分母","历史状态重标","PV 矩阵乘","归一化与写回","循环控制","分区合并"];
+const palette={Tensor:["#06695a","#e5f3ec"],Vector:["#684185","#f2ecf7"],DMA:["#325f84","#eaf1f8"],Control:["#855109","#faf0dc"]};
+let M, refModel;
+function tileData(c,z,idx,partIdx,stepIdx){
+ const b=z.blocks[idx],lo=Math.floor(partIdx*b.count/b.s),hi=Math.floor((partIdx+1)*b.count/b.s);
+ const col=hi-1-stepIdx,k0=col*z.n,k1=Math.min(k0+z.n,z.L);
+ const first=stepIdx===0,last=col===lo,merging=b.s>1&&partIdx===b.s-1&&last;
+ let valid=0;for(let r=b.begin;r<b.end;r++){const lim=c.causal==="yes"?c.p+Math.floor(r/z.factor)+1:z.L;valid+=clamp(lim-k0,0,k1-k0)}
+ return {b,lo,hi,col,k0,k1,valid,first,last,merging,steps:hi-lo,pageLoads:ceil(k1/c.page)-Math.floor(k0/c.page)}
+}
+// Each entry is one reference-ISA instruction site. Counts use the selected tile and operand granularity.
+function instructions(c,z,t){
+ const a=[],m=c.m,n=z.n,l=c.lanes, row=m,rows=t.b.rows,sg=ceil(n/l),vg=ceil(c.dv/l),sv=row*sg,ov=row*vg;
+ const init=t.first?row:0,h=t.first?0:row,r=t.last?row:0, out=t.last?t.b.rows:0;
+ const slices=ceil(c.dk/(c.hs==="full"?c.dk:+c.hs)), spills=c.spill==="sram"?slices-1:0;
+ function op(id,st,en,mn,title,asm,cnt,parents,note=""){a.push({id,st,en,mn,title,asm,cnt,parents:parents.split(" ").filter(Boolean),note})}
+ const C=(...v)=>op(v[0],v[1],"Control",...v.slice(2)),D=(...v)=>op(v[0],v[1],"DMA",...v.slice(2)),V=(...v)=>op(v[0],v[1],"Vector",...v.slice(2)),T=(...v)=>op(v[0],v[1],"Tensor",...v.slice(2));
+ C("qaddr",0,"S.MAD","Q 行地址","qptr ← qbase + qrow × strideQ",1,"");
+ C("pidx",0,"S.DIV.U","逻辑页号","page ← kpos / pageSize",t.pageLoads,"");
+ C("poff",0,"S.REM.U","页内偏移","off ← kpos % pageSize",t.pageLoads,"pidx");
+ D("ptab",0,"LD.U32","读页表","phys ← table[head, page]",t.pageLoads,"pidx","按当前 tile 各不同页号读一次，未模拟 warp 重读。");
+ C("kaddr",0,"S.MAD","K 物理地址","kptr ← KpageBase[phys] + off × strideK",t.pageLoads,"ptab poff");
+ C("vaddr",0,"S.MAD","V 物理地址","vptr ← VpageBase[phys] + off × strideV",t.pageLoads,"ptab poff");
+ D("ldq",0,"DMA.COPY","装入 Q","Qbuf ← source[qptr, rows × dk]",t.first||c.qstay==="load"?1:0,"qaddr","二维 DMA 描述符；后续块可命中 Q 缓冲。");
+ D("ldk",0,"DMA.COPY","装入 K","Kbuf ← source[kptr, keys × dk]",t.pageLoads,"kaddr");
+ D("ldv",0,"DMA.COPY","装入 V","Vbuf ← source[vptr, keys × dv]",t.pageLoads,"vaddr");
+ D("commit",0,"DMA.COMMIT","提交异步组","publish event(Eqk, Ev)",1,"ldq ldk ldv","两个完成事件可独立就绪。");
+ C("waitq",1,"WAIT.EVT","等 Q/K 就绪","wait Eqk",1,"commit");
+ T("tq",1,"T.LD.A","取 Q 片段","Areg ← Qbuf[mi, kk]",c.qfeed==="keep"&&!t.first?0:ceil(m/c.ma)*ceil(c.dk/c.ka),"waitq","逻辑原子片段，允许跨列广播复用。");
+ T("tk",1,"T.LD.B","取 K 片段","Breg ← Kbuf[nj, kk]ᵀ",ceil(n/c.na)*ceil(c.dk/c.ka),"waitq");
+ T("clearS",1,"T.ZERO","清 score 累加器","Sacc[mi,nj] ← 0",ceil(m/c.ma)*ceil(n/c.na),"");
+ T("ldpartial",1,"T.LD.C","恢复切片部分和","Sacc ← SRAM[partialS]",spills*ceil(m/c.ma)*ceil(n/c.na),"spill");
+ T("qk",1,"T.MMA","QK 乘加","Sacc ← Areg × Breg + Sacc",ceil(m/c.ma)*ceil(n/c.na)*ceil(c.dk/c.ka),"tq tk clearS ldpartial","原子形状 "+c.ma+"×"+c.na+"×"+c.ka+"。每个乘加贡献 2 FLOP。");
+ T("spill",1,"T.ST.C","保存切片部分和","SRAM[partialS] ← Sacc",spills*ceil(m/c.ma)*ceil(n/c.na),"qk","非最后一个 head 切片触发，与恢复节点构成内层循环。");
+ T("sendS",1,"T.SEND","交付 FP32 score","S port ← Sacc",ceil(m/c.ma)*ceil(n/c.na),"qk");
+ C("waitS",2,"WAIT.EVT","等 score 就绪","wait E_score",1,"sendS");
+ V("ldS",2,"V.LD.F32","读 score","vX ← S port[row, j:j+VL]",sv,"waitS");
+ V("scale",2,"V.MUL.F32","score 缩放","vS ← vX × (1/√dk)",sv,"ldS","scale 为预计算常数。");
+ const masks=(t.col+1)*n>(c.causal==="yes"?c.p+Math.floor(t.b.begin/z.factor)+1:z.L);
+ V("cmp",2,"V.CMP.LT","生成可见谓词","mask ← keyIndex < visibleEnd[row]",masks?sv:0,"scale");
+ V("mask",2,"V.SEL.F32","遮住无效列","vS ← select(mask, vS, −∞)",masks?sv:0,"cmp scale");
+ V("rmax",2,"V.REDMAX","块内段最大","segMax ← horizontal_max(vS)",sv,"mask scale","每条归约最多 VL 个元素。");
+ V("segmax",2,"V.MAX.F32","合并段最大","blockMax ← max(blockMax, segMax)",row*(sg-1),"rmax","第一段直接作为初值；段间比较已含在 A−J 中。");
+ V("max",2,"V.MAX.F32","合并历史 max","m′ ← max(m_old, blockMax)",h,"segmax rmax","首块 m′ = blockMax。m_old 来自前一个扫描步。");
+ V("reload",3,"V.LD.F32","重取 score","vX ← S port[row, j:j+VL]",c.reread==="2"?sv:0,"sendS","重扫路径重取原始 score，需再缩放与掩码。");
+ V("rescale",3,"V.MUL.F32","重扫缩放","vS ← vX × scale",c.reread==="2"?sv:0,"reload");
+ V("remask",3,"V.SEL.F32","复用可见谓词","vS ← select(mask,vS,−∞)",c.reread==="2"&&masks?sv:0,"rescale cmp");
+ V("center",3,"V.SUB.F32","减去当前最大值","vZ ← vS − broadcast(m′)",sv,"scale mask max rmax remask","全遮罩行用安全基准 0 处理 −∞。");
+ V("exp",3,"V.EXP.F32","权重指数","vP ← exp(vZ)",sv,"center");
+ V("rsum",3,"V.REDSUM","块内段求和","segSum ← horizontal_sum(vP)",sv,"exp");
+ V("segsum",3,"V.ADD.F32","合并段和","blockSum ← blockSum + segSum",row*(sg-1),"rsum","第一段直接作为初值。段间 ADD 计入 REDSUM 等价工作。");
+ V("cvtp",3,"V.CVT","转换 P","vPmma ← convert(vP, P_type)",sv,"exp");
+ V("stp",3,"V.ST","交付 P","P port ← vPmma",sv,"cvtp");
+ V("delta",4,"V.SUB.F32","历史 max 差","diff ← m_old − m′",h,"max","m_old、ℓ_old、U_old 由上一个 KV 块反馈。");
+ V("alpha",4,"V.EXP.F32","重标系数","α ← exp(diff)",h,"delta");
+ V("scaleL",4,"V.MUL.F32","旧分母重标","ℓscaled ← α × ℓ_old",h,"alpha");
+ V("sum",4,"V.ADD.F32","更新分母","ℓ′ ← ℓscaled + blockSum",h,"scaleL segsum rsum","首块以 blockSum 起始。");
+ C("waitU",4,"WAIT.EVT","等上一块 PV","wait E_prevPV",t.first?0:1,"pv");
+ op("loadU",4,"Vector","V.LD.F32","读取旧 U","vU ← SRAM[oldU]",c.uplace==="sram"?h*vg:0,"waitU");
+ op("scU",4,c.uplace==="tensor"?"Tensor":"Vector",c.uplace==="tensor"?"T.ROWSCALE":"V.MUL.F32","缩放未归一化输出","Uscaled ← α × U_old",h*vg,"waitU loadU alpha","行系数广播。首块的 MMA 使用清零的 C 操作数。");
+ V("putU",4,"V.ST.F32","送回缩放结果","SRAM[Uscaled] ← vU",c.uplace==="sram"?h*vg:0,"scU");
+ C("waitP",5,"WAIT.EVT","等 P、V 和累加器","wait E_P, E_V, E_Uscaled",1,"stp commit scU putU");
+ T("tp",5,"T.LD.A","取 P 片段","Areg ← P port[mi, kk]",ceil(m/c.ma)*ceil(n/c.ka),"waitP");
+ T("tv",5,"T.LD.B","取 V 片段","Breg ← Vbuf[kk, vj]",ceil(n/c.ka)*ceil(c.dv/c.na),"waitP");
+ T("clearU",5,"T.ZERO","首块清 U","Uacc ← 0",t.first?ceil(m/c.ma)*ceil(c.dv/c.na):0,"");
+ T("pv",5,"T.MMA","PV 乘加","Uacc ← Areg × Breg + Uacc",ceil(m/c.ma)*ceil(c.dv/c.na)*ceil(n/c.ka),"tp tv clearU scU","首块从 0 累加，后续从缩放后的 U 累加。");
+ T("saveU",5,"T.ST.C","导出 U","SRAM[U] ← Uacc",c.uplace==="sram"?ceil(m/c.ma)*ceil(c.dv/c.na):0,"pv");
+ C("finalWait",6,"WAIT.EVT","等本分区末次 PV","wait E_PV",t.last?1:0,"pv");
+ V("rcp",6,"V.RCP.F32","分母倒数","inv ← reciprocal(ℓ′)",r,"sum rsum segsum","零分母时以谓词置零输出。");
+ op("norm",6,c.uplace==="tensor"?"Tensor":"Vector",c.uplace==="tensor"?"T.ROWSCALE":"V.MUL.F32","输出归一化","Olocal ← Uacc × inv",r*vg,"rcp finalWait");
+ V("log",6,"V.LOG.F32","分母对数","logL ← log(ℓ′)",r,"sum segsum rsum");
+ V("lse",6,"V.ADD.F32","行 LSE","Llocal ← m′ + logL",r,"log max rmax","空分区置 Llocal = −∞。");
+ V("cvto",6,"V.CVT","转换最终 O","vOut ← convert(Olocal, O_type)",t.b.s===1?out*vg:0,"norm");
+ D("writeO",6,"DMA.ST","写出 O","dstO ← Olocal / vOut",t.last?1:0,"norm cvto","多分区时写 FP32 局部 O，单分区时写最终 O。");
+ D("writeL",6,"DMA.ST","写出 LSE","dstL ← Llocal",t.last?1:0,"lse");
+ C("nextK",7,"S.SUB","移动 KV 游标","kvBlock ← kvBlock − 1",1,"pv");
+ C("testK",7,"S.CMP.GE","检查分区下界","more ← kvBlock ≥ splitBegin",1,"nextK");
+ C("brK",7,"BR.P","重复 KV 内循环","if more: jump page_lookup",1,"testK","保留 m′、ℓ′、Uacc。DMA 预取可以提前。");
+ C("nextQ",7,"S.ADD","推进工作项","work ← work + 1",t.last?1:0,"writeO writeL");
+ C("brQ",7,"BR.LT","下一 Q 块或分区","if work < limit: jump q_address",t.last?1:0,"nextQ","工作项也可由 CTA 网格分派，此处用显式循环说明。");
+ const g=t.merging?rows:0,s=t.b.s,sgs=ceil(s/l);
+ C("join",8,"WAIT.ALL","等所有分区","wait all split completion events",t.merging?1:0,"writeO writeL");
+ D("readParts",8,"DMA.LD","读部分 O / LSE","buffer ← partial[split,row]",t.merging?s:0,"join");
+ V("mergeMax",8,"V.REDMAX.ACC","分区最大 LSE","mx ← reduce_max(Llocal[])",g*sgs,"readParts");
+ V("mergeSub",8,"V.SUB.F32","分区中心化","z ← Llocal − mx",g*sgs,"mergeMax");
+ V("mergeExp",8,"V.EXP.F32","分区权重","w ← exp(z)",g*sgs,"mergeSub");
+ V("mergeSum",8,"V.REDSUM.ACC","分区权重和","d ← reduce_sum(w[])",g*sgs,"mergeExp");
+ V("mergeRcp",8,"V.RCP.F32","合并倒数","inv ← reciprocal(d)",g,"mergeSum");
+ V("mergeScale",8,"V.MUL.F32","归一化权重","w ← w × inv",g*sgs,"mergeRcp mergeExp");
+ V("mergeMul",8,"V.MUL.F32","局部输出加权","vZ ← Olocal × w",g*s*vg,"mergeScale readParts");
+ V("mergeAdd",8,"V.ADD.F32","跨分区累加","vOut ← vOut + vZ",g*(s-1)*vg,"mergeMul");
+ V("mergeLog",8,"V.LOG.F32","合并对数","vLog ← log(d)",g,"mergeSum");
+ V("mergeLse",8,"V.ADD.F32","合并 LSE","L ← mx + vLog",g,"mergeLog mergeMax");
+ V("mergeCvt",8,"V.CVT","最终窄化","O ← convert(vOut, O_type)",g*vg,"mergeAdd");
+ D("mergeStore",8,"DMA.ST","提交 O / LSE","mem ← O, L",t.merging?2:0,"mergeCvt mergeLse");
+ return a
+}
+</script>
+<script>
+fields[1][1].push(["isa","非线性指令","base2",["base2|展开 EXP2 / LOG2","native|原生 EXP / LOG"]]);
+for(const c of [base,configs.decode,configs.short,cfg,saved])c.isa="base2";
+unitCaps.CMP=1000;
+function expand(program,c,t,z){
+ const result=[];
+ function add(template,id,mn,title,asm,cnt,parents,note=""){const v={...template,id,mn,title,asm,cnt,parents,note};result.push(v);return v}
+ for(const u of program){
+  const parents=[...u.parents];
+  const payloadProducer={tq:"ldq",tk:"ldk",tp:"stp",tv:"ldv",pv:"scU",rcp:"sum"};
+  if(payloadProducer[u.id]&&!parents.includes(payloadProducer[u.id]))parents.push(payloadProducer[u.id]);
+  function before(id,en,mn,title,asm,cnt,deps){add({...u,en},id,mn,title,asm,cnt,deps)}
+  if(u.id==="qaddr"){
+   before("beginQ","Control","S.MUL","Q 块起点","qrow ← blockIdx × M",t.first?1:0,[]);
+   before("beginK","Control","S.MUL","KV 块起点","kpos ← kvBlock × N",1,["nextK"]);
+   before("qtoken","Control","S.DIV.U","组头还原 token","token ← packedRow / groupSize",t.first&&z.pack?t.b.rows:0,["beginQ"]);
+   before("qHead","Control","S.REM.U","组内查询头","headWithinGroup ← packedRow % groupSize",t.first&&z.pack?t.b.rows:0,["beginQ"]);
+   before("limit","Control","S.ADD","因果行上界","visibleEnd ← (prefix + 1) + token",t.first&&c.causal==="yes"?t.b.rows:0,["qtoken","beginQ"]);
+   parents.push("beginQ","qHead")
+  }
+  if(u.id==="pidx"||u.id==="poff")parents.push("beginK");
+  if(u.id==="ldk"){
+   before("freeBuf","Control","WAIT.FREE","等环形缓冲可写","wait reusable(Kbuf, Vbuf)",z.blocks.length&&t.hi-1-t.col>=c.buffers?1:0,["pv","qk"]);
+   parents.push("freeBuf")
+  }
+  if(u.id==="tq"){
+   before("ctaReady","Control","BAR.SYNC","共享装填可见","barrier producer → MMA consumers",1,["waitq"]);parents.push("ctaReady")
+  }
+  if(u.id==="max"){
+   before("mcarry","Vector","V.MOV.F32","保留历史最大值","prevM ← m_old",t.first?0:c.m,["brK"]);
+   parents.push("mcarry")
+  }
+  if(u.id==="scaleL")parents.push("brK");
+  if(u.id==="scU"&&c.uplace==="tensor"){
+   before("sendAlpha","Vector","V.SEND","送行重标系数","rowPort ← α",t.first?0:c.m,["alpha"]);parents.push("sendAlpha")
+  }
+  if(u.id==="norm"&&c.uplace==="tensor"){
+   before("sendInv","Vector","V.SEND","送行归一化系数","rowPort ← inv",t.last?c.m:0,["rcp"]);parents.push("sendInv")
+  }
+  if(u.id==="writeO")u.asm=t.b.s===1?"finalO ← vOut":"partialO ← Olocal (FP32)";
+  if(u.id==="mergeStore"){
+   before("mergeStoreO","DMA","DMA.ST","提交最终 O","finalO ← O",t.merging?1:0,["mergeCvt"]);
+   u.mn="DMA.ST";u.title="提交最终 LSE";u.asm="finalLSE ← L";u.cnt=t.merging?1:0;parents.splice(0,parents.length,"mergeLse")
+  }
+  if(u.id==="kaddr"||u.id==="vaddr"){
+   const base=u.id==="kaddr"?"baseK":"baseV";before(base,"Control","S.MAD","物理页基址","pageBase ← cacheBase + phys × pageStride",t.pageLoads,["ptab"]);parents.push(base)
+  }
+  if(u.id==="cmp")parents.push("limit","beginK");
+  if((u.id==="cvtp"&&c.bp===4)||(["cvto","mergeCvt"].includes(u.id)&&c.bo===4)){u.cnt=0;u.note="FP32 源和目的同格式，沿用源寄存器。"}
+  if(u.id==="center"){
+   before("badmax","Vector","V.CMP.EQ","检测空行块","pEmpty ← (m′ == −∞)",c.m,["max","rmax","segmax"]);
+   before("safeMax","Vector","V.SEL.F32","选择安全基准","mSafe ← select(pEmpty, 0, m′)",c.m,["badmax"]);
+   parents.push("safeMax");u.asm="vZ ← vS − broadcast(mSafe)"
+  }
+  if(u.id==="delta"){parents.push("safeMax");u.asm="diff ← m_old − mSafe"}
+  if(u.id==="rcp"){
+   before("zeroL","Vector","V.CMP.EQ","检测零分母","pZero ← (ℓ′ == 0)",t.last?c.m:0,["sum","rsum"]);
+   before("safeL","Vector","V.SEL.F32","选择安全分母","ℓsafe ← select(pZero, 1, ℓ′)",t.last?c.m:0,["zeroL"]);parents.push("safeL");u.asm="inv ← reciprocal(ℓsafe)"
+  }
+  if(u.id==="log")u.asm="logL ← log(ℓ′)　·　log(0)=−∞";
+  if(u.id==="tp"&&c.uplace==="sram")before("restoreU","Tensor","T.LD.C","取回已重标 U","Uacc ← SRAM[Uscaled]",t.first?0:ceil(c.m/c.ma)*ceil(c.dv/c.na),["putU","waitP"]);
+  if(u.id==="pv"&&c.uplace==="sram")parents.push("restoreU");
+  if(u.id==="norm"&&c.uplace==="sram"){
+   before("lastLoadU","Vector","V.LD.F32","取分区末次 U","vU ← SRAM[U]",t.last?c.m*ceil(c.dv/c.lanes):0,["saveU","finalWait"]);parents.push("lastLoadU")
+  }
+  if(u.id==="qk")u.cnt=ceil(c.m/c.ma)*ceil(z.n/c.na)*inputAtoms(c);
+  if(u.id==="tq"&&u.cnt)u.cnt=ceil(c.m/c.ma)*inputAtoms(c);
+  if(u.id==="tk")u.cnt=ceil(z.n/c.na)*inputAtoms(c);
+  if(u.id==="brQ"){
+   before("nextTest","Control","S.CMP.LT","检查工作队列","moreWork ← work < limit",t.last?1:0,["nextQ"]);parents.push("nextTest");u.mn="BR.P";u.asm="if moreWork: jump q_address"
+  }
+  if((u.mn==="V.EXP.F32"||u.mn==="V.LOG.F32")&&c.isa==="base2"){
+   const exp=u.mn==="V.EXP.F32",id=u.id+"_base";
+   add(u,id,exp?"V.MUL.F32":"V.LG2.F32",exp?"指数换底":"二进制对数",exp?"vTmp ← arg × log₂(e)":"vTmp ← log₂(arg)",u.cnt,parents,"arg 取自 "+u.asm);
+   add(u,u.id,exp?"V.EX2.F32":"V.MUL.F32",u.title,exp?"dst ← 2^vTmp":"dst ← vTmp × ln(2)",u.cnt,[id],u.asm);continue
+  }
+  if(["rmax","rsum","mergeMax","mergeSum"].includes(u.id)){
+   if(c.red==="unit"){
+    add(u,u.id,u.id==="rmax"||u.id==="mergeMax"?"V.REDMAX.ACC":"V.REDSUM.ACC",u.title,"rd ← reduce_acc(seed, vSrc, VL)",u.cnt,parents,"专用 RED 逐段延续标量 seed。首段用首元素初始化。");continue
+   }
+   const ismax=u.id==="rmax"||u.id==="mergeMax",merge=u.id.startsWith("merge"),w=Math.min(c.lanes,merge?t.b.s:z.n);
+   let deps=parents;
+   const more=merge&&t.b.s>c.lanes;
+   for(let k=1;k<w;k*=2){
+    const id=u.id+"_sh"+k,tail=k*2>=w&&!more?u.id:u.id+"_op"+k;
+    add(u,id,"V.SHFL.DOWN","取相邻 lane · "+k,"peer ← shuffle_down(value, "+k+")",u.cnt,deps,"段内归约，活动 lane 读取有效伙伴。");
+    add(u,tail,ismax?"V.MAX.F32":"V.ADD.F32",ismax?"lane 间最大":"lane 间相加","@pair value ← "+(ismax?"max(value,peer)":"value + peer"),u.cnt,[id],"只使能归约树的有效边，每段 n 个元素共 n−1 个二元操作。");deps=[tail]
+   }
+   if(more)add(u,u.id,ismax?"V.MAX.F32":"V.ADD.F32","合并分区归约段","acc ← combine(acc,seg)",t.merging?t.b.rows*(ceil(t.b.s/c.lanes)-1):0,deps);
+   if(w<=1)add(u,u.id,"V.MOV","单元素段","value ← input",u.cnt,parents);
+   continue
+  }
+  if(c.red==="unit"&&["segmax","segsum"].includes(u.id)){u.cnt=0;u.note="段间合并由专用 RED 的 seed 完成。"}
+  result.push({...u,parents})
+ }
+ return result
+}
+function estimate(c){
+ const m=model(c),z=m.z;
+ const atom=2*c.ma*c.na*c.ka;
+ m.qk=atom*z.scans*ceil(c.m/c.ma)*ceil(z.n/c.na)*inputAtoms(c);
+ m.pv=atom*z.scans*ceil(c.m/c.ma)*ceil(c.dv/c.na)*ceil(z.n/c.ka);
+ m.f=m.qk+m.pv;m.t=m.f/(c.pt*1e6);
+ const pageBytes=c.meta==="on"?4*z.pages:0;m.traffic["源存储 · 页表"]=[pageBytes,0];
+ m.dram+=pageBytes;m.memUs=m.dram/(1000*c.dram);m.effBW=m.dram/m.t/1000;
+ if(c.reread==="2"){m.work.MUL+=z.A;m.work.SELECT+=z.masked}
+ m.work.CMP=z.masked+z.J+z.R;m.work.SELECT+=z.J+z.R;
+ m.work.CVT=(c.bp===4?0:z.A)+(c.bo===4?0:z.finalR*c.dv);
+ m.work.SHFL=0;
+ if(c.red==="tree"){
+  m.work.MAX+=m.work.REDMAX;m.work["ADD/SUB"]+=m.work.REDSUM;
+  let local=z.scans*c.m*(z.n-ceil(z.n/c.lanes));
+  for(const b of z.blocks)if(b.s>1)local+=z.copies*b.rows*(b.s-ceil(b.s/c.lanes));
+  m.work.SHFL=2*local;m.work.REDMAX=m.work.REDSUM=0
+ }
+ if(c.isa==="base2")m.work.MUL+=m.work.EXP+m.work.LOG;
+ return m
+}
+let prog=[],tile;
+const svgNS="http://www.w3.org/2000/svg";
+function tag(name,attrs,parent,txt){const node=document.createElementNS(svgNS,name);for(const [k,v] of Object.entries(attrs))node.setAttribute(k,v);parent.append(node);if(txt!==undefined)node.textContent=txt;return node}
+function table(id,heads,rows){
+ const root=el(id);root.innerHTML="";const tb=document.createElement("table"),th=tb.createTHead().insertRow();
+ heads.forEach(x=>{const h=document.createElement("th");h.textContent=x;th.append(h)});
+ const body=tb.createTBody();for(const row of rows){const tr=body.insertRow();for(const v of row){const td=tr.insertCell();if(v instanceof Node)td.append(v);else td.textContent=v}}
+ root.append(tb)
+}
+function delta(x,y,d=2){return (x>y?"+":"")+num(x-y,d)}
+function tileSlider(id,v,max){el(id).max=max;el(id).value=v;el(id).disabled=max===0;el(id+"Label").textContent=(v+1)+"/"+(max+1)}
+function stop(){if(timer!==null)clearInterval(timer);timer=null;el("play").textContent="播放"}
+function move(dir){
+ const blocks=M.z.blocks;let b=blocks[outer];
+ if(dir>0){if(step+1<tile.steps)step++;else if(part+1<b.s){part++;step=0}else if(outer+1<blocks.length){outer++;part=step=0}else{stop();return}}
+ else if(step)step--;else if(part||outer){if(part)part--;else{outer--;part=blocks[outer].s-1}b=blocks[outer];step=Math.floor((part+1)*b.count/b.s)-Math.floor(part*b.count/b.s)-1}else return;
+ renderTile()
+}
+
+// Each box has a stable place in the same pipeline; IR expansion grows that row in place.
+const pipelineGroups=[
+ ["ldq",0,0,"Load Q","Qᵢ → Qbuf","beginQ qtoken qHead qaddr ldq"],
+ ["ptab",0,3,"Page lookup","逻辑页 → 物理页","beginK pidx poff ptab baseK baseV kaddr vaddr"],
+ ["ldk",0,2,"Load K","Kⱼ → Kbuf","freeBuf ldk"],
+ ["commit",0,5,"Commit","发布 Q/K、V 事件","commit"],
+ ["ldv",0,4,"Load V","Vⱼ → Vbuf","ldv"],
+ ["waitq",0,1,"Wait Q/K","等片段可用","waitq ctaReady"],
+ ["qk",1,0,"MM · QKᵀ","X = Qᵢ Kⱼᵀ","tq tk clearS ldpartial qk spill sendS"],
+ ["scale",1,1,"Mul","S = X × scale","waitS ldS scale"],
+ ["mask",1,2,"Compare / select","因果 mask → −∞","limit cmp mask"],
+ ["rmax",1,3,"Reduce max","按行求 blockMax","rmax segmax"],
+ ["max",1,4,"Max","m′ = max(m, blockMax)","mcarry max badmax safeMax"],
+ ["center",1,5,"Sub","Z = S − m′","reload rescale remask center"],
+ ["delta",2,0,"Sub","历史差值 m − m′","delta"],
+ ["alpha",2,1,"Exp","α = exp(m − m′)","alpha_base alpha"],
+ ["scaleL",2,2,"Mul","ℓscaled = α × ℓ","scaleL"],
+ ["sum",2,3,"Add","ℓ′ = ℓscaled + blockSum","sum"],
+ ["rsum",2,4,"Reduce sum","blockSum = Σ P","rsum segsum"],
+ ["exp",2,5,"Exp","P = exp(Z)","exp_base exp"],
+ ["scU",3,0,"Mul · row scale","Uscaled = α × U","waitU loadU sendAlpha scU putU"],
+ ["brK",3,1,"KV loop","j ← j − 1，检查下界","nextK testK brK"],
+ ["pv",3,2,"MM · PV","U′ = P Vⱼ + Uscaled","tp tv clearU restoreU pv saveU"],
+ ["waitP",3,3,"Wait P / V / U","等 PV 操作数就绪","waitP"],
+ ["cvtp",3,5,"Convert / store","P → MMA 输入精度","cvtp stp"],
+ ["lse",4,0,"Add","LSE = m′ + log ℓ′","lse writeL"],
+ ["log",4,1,"Log","log ℓ′","log_base log"],
+ ["rcp",4,2,"Reciprocal","r = 1 / ℓ′","zeroL safeL rcp"],
+ ["norm",4,3,"Mul","O = U′ × r","finalWait lastLoadU sendInv norm"],
+ ["cvto",4,4,"Convert / store","O → 输出精度","cvto writeO"],
+ ["brQ",4,5,"Outer loop","推进分区或 Q 块","nextQ nextTest brQ"],
+ ["join",5,0,"Wait all","读取分区 O、LSE","join readParts"],
+ ["mergeMax",5,1,"Reduce max","mx = max(Lₛ)","mergeMax"],
+ ["mergeSub",5,2,"Sub","zₛ = Lₛ − mx","mergeSub"],
+ ["mergeExp",5,3,"Exp","wₛ = exp(zₛ)","mergeExp_base mergeExp"],
+ ["mergeSum",5,4,"Reduce sum","d = Σ wₛ","mergeSum"],
+ ["mergeRcp",5,5,"Reciprocal","inv = 1 / d","mergeRcp"],
+ ["mergeStore",6,0,"Store","提交最终 O / LSE","mergeStoreO mergeStore"],
+ ["mergeLse",6,1,"Log / add","LSE = mx + log d","mergeLog_base mergeLog mergeLse"],
+ ["mergeCvt",6,2,"Convert","O → 输出精度","mergeCvt"],
+ ["mergeAdd",6,3,"Add","O = Σ weightedOₛ","mergeAdd"],
+ ["mergeMul",6,4,"Mul","weightedOₛ = Oₛ × wₛ","mergeMul"],
+ ["mergeScale",6,5,"Mul","wₛ ← wₛ × inv","mergeScale"]
+];
+const owner=new Map();for(const [key,r,c,title,note,ids] of pipelineGroups)for(const id of ids.split(" "))owner.set(id,key);
+function ownerOf(id){return owner.get(id)||owner.get(id.split("_")[0])}
+const openBoxes=new Set();let showIR=false,zoom=1,layoutCache=null;
+const W=1216,BW=162,DX=196,X0=34,HEADER=186;
+function pickInstruction(id,reveal=false){
+ selected=id;if(reveal)openBoxes.add(ownerOf(id));graph();
+ if(reveal)el("graph").querySelector('[data-ir="'+id+'"]')?.scrollIntoView({block:"nearest",inline:"nearest"})
+}
+function svgButton(g,fn,label){g.setAttribute("role","button");g.setAttribute("tabindex","0");g.setAttribute("aria-label",label);g.style.cursor="pointer";g.onclick=e=>{e.stopPropagation();fn()};g.onkeydown=e=>{if(e.target===g&&(e.key==="Enter"||e.key===" ")){e.preventDefault();e.stopPropagation();fn()}}}
+function jumpBlock(kind,index){
+ stop();if(kind==="Q"){outer=index;part=step=0}
+ else{const b=M.z.blocks[outer];part=Math.min(b.s-1,ceil((index+1)*b.s/b.count)-1);step=Math.floor((part+1)*b.count/b.s)-1-index}
+ renderTile()
+}
+function matrixStrip(root,kind,x,w,col,stroke){
+ const z=M.z,b=tile.b,isQ=kind==="Q",at=isQ?outer:tile.col,total=isQ?z.blocks.length:b.count;
+ const height=isQ?cfg.m:z.n,width=kind==="V"?cfg.dv:cfg.dk;
+ const y=32,head=isQ?"外层 Q 块 i":"内层 KV 块 j",range=isQ?[b.begin,b.end]:[tile.k0,tile.k1];
+ const data=tag("g",{"data-matrix":kind},root);
+ tag("text",{x,y,"font-size":17,"font-weight":700,fill:stroke},data,kind+"   "+(isQ?"M × dₖ":kind==="K"?"N × dₖ":"N × dᵥ")+" = "+height+" × "+width);
+ tag("text",{x,y:y+19,"font-size":11,fill:"#445655"},data,head+" = "+at+"（共 "+total+" 块）　"+(isQ?"行":"KV")+" ["+range.join(", ")+")");
+ let indices=[...new Set([0,at-1,at,at+1,total-1].filter(v=>v>=0&&v<total))].sort((a,b)=>a-b);
+ if(isQ&&total===1)indices=[0];
+ const slots=[];indices.forEach((v,i)=>{if(i&&v>indices[i-1]+1)slots.push(null);slots.push(v)});
+ const gap=6,avail=(w-gap*(slots.length-1)-slots.filter(v=>v===null).length*19)/indices.length;
+ const blockW=Math.min(74,avail,Math.max(20,48*width/height)),blockH=Math.max(10,Math.min(49,blockW*height/width));
+ let pos=x,port;
+ for(const idx of slots){
+  if(idx===null){tag("text",{x:pos+2,y:86,fill:"#718181","font-size":15},data,"…");pos+=19+gap;continue}
+  const realRows=Math.min(height,(isQ?cfg.q*z.factor:z.L)-idx*height);
+  const h=Math.max(4,blockH*realRows/height),cy=86-h/2,active=idx===at;
+  const group=tag("g",{"data-block":idx,"data-active":active},data);
+  if(active)port=[pos+blockW*.83,cy+h];
+  tag("rect",{x:pos,y:cy,width:blockW,height:h,fill:active?col:"#fff",stroke,"stroke-width":active?2.3:1},group);
+  const cols=Math.min(8,Math.max(2,Math.round(blockW/8)),width),rows=Math.min(realRows,Math.max(1,Math.round(h/8)));
+  for(let j=1;j<cols;j++)tag("line",{x1:pos+j*blockW/cols,x2:pos+j*blockW/cols,y1:cy,y2:cy+h,stroke,"stroke-width":.8},group);
+  for(let j=1;j<rows;j++)tag("line",{x1:pos,x2:pos+blockW,y1:cy+j*h/rows,y2:cy+j*h/rows,stroke,"stroke-width":.8},group);
+  tag("text",{x:pos+blockW/2,y:122,"text-anchor":"middle","font-size":11,fill:active?"#152e30":"#67756e","font-weight":active?750:400},group,(active?"▸ ":"")+kind+"["+idx+"]");
+  tag("title",{},group,kind+"["+idx+"]　"+realRows+" × "+width+"，点击定位");svgButton(group,()=>jumpBlock(kind,idx),kind+" 块 "+idx);pos+=blockW+gap
+ }
+ tag("text",{x,y:146,"font-size":11,fill:"#445655"},data,isQ?(cfg.qstay==="keep"?"Q 源块在本分区驻留":"每步从源端重新装 Q"):"j = "+(tile.hi-1)+" → "+tile.lo+"，与"+(kind==="K"?" V ":" K ")+"同步逆序扫描");
+ return {port,x};
+}
+function groupLayout(){
+ const cluster=new Map(pipelineGroups.map(([id,r,c,title,note])=>[id,{id,r,c,title,note,nodes:[]}]));
+ for(const u of prog){const g=cluster.get(ownerOf(u.id));if(!g)throw Error("未映射的 IR "+u.id);g.nodes.push(u)}
+ const items=[...cluster.values()].filter(g=>g.nodes.length&&(g.r<5||cfg.split>1||showIR||openBoxes.has(g.id)));
+ const rowHs=[],expandH=22;
+ for(const g of items){g.expanded=showIR||openBoxes.has(g.id);g.h=56+(g.expanded?g.nodes.length*expandH+6:0);rowHs[g.r]=Math.max(rowHs[g.r]||0,g.h)}
+ const rowT=[];let y=HEADER+25;
+ rowHs.forEach((h,i)=>{rowT[i]=y;y+=h+62});
+ for(const g of items){g.x=X0+DX*g.c;g.y=rowT[g.r];g.cx=g.x+BW/2;g.cy=g.y+28}
+ const pairs=new Map(),shown=new Set(items.map(g=>g.id));
+ function edge(from,to,flag,desc){
+  if(!shown.has(from)||!shown.has(to)||from===to)return;
+  const key=[from,to,flag].join("/");if(!pairs.has(key))pairs.set(key,{from,to,back:flag,info:[]});pairs.get(key).info.push(desc)
+ }
+ const carried=new Set(["pv/freeBuf","qk/freeBuf","nextK/beginK","brK/mcarry","brK/scaleL","pv/waitU"]);
+ for(const u of prog)for(const p of u.parents)edge(ownerOf(p),ownerOf(u.id),carried.has(p+"/"+u.id),p+" → "+u.id);
+ edge("max","delta",true,"上一步 m′ → 本步 m_old");edge("max","max",true,"跨步最大值");edge("sum","scaleL",true,"上一步 ℓ′ → 本步 ℓ_old");edge("pv","scU",true,"上一步 U′ → 本步 U_old");
+ edge("brQ","ldq",true,"下一个 Q 工作项 → Q 地址");edge("brK","ptab",true,"下一 KV 块 → 页地址");
+ return {items,rowT,rowHs,height:y+6,edges:[...pairs.values()]}
+}
+
+function routeMap(layout){
+ const nodes=layout.items, xs=new Set([10,W-10]),ys=new Set([HEADER+1,layout.height-9]);
+ for(const g of nodes){for(const x of [g.x-19,g.x-8,g.cx,g.x+BW+8,g.x+BW+19])xs.add(x);for(const y of [g.y-18,g.y-8,g.cy,g.y+g.h+8,g.y+g.h+20])ys.add(y)}
+ const X=[...xs].sort((a,b)=>a-b),Y=[...ys].sort((a,b)=>a-b),nx=X.length;
+ const grid=(x,y)=>Y.indexOf(y)*nx+X.indexOf(x),xy=id=>[X[id%nx],Y[Math.floor(id/nx)]];
+ const adj=Array.from({length:nx*Y.length},()=>[]);
+ function connect(i,j,dir){const [a,b]=xy(i),[c,d]=xy(j);
+  if(nodes.some(g=>a<g.x+BW+3&&c>g.x-3&&b<g.y+g.h+3&&d>g.y-3))return;
+  const len=c-a+d-b;adj[i].push([j,dir,len]);adj[j].push([i,dir,len])
+ }
+ for(let y=0;y<Y.length;y++)for(let x=0;x<nx;x++){const i=y*nx+x;if(x+1<nx)connect(i,i+1,0);if(y+1<Y.length)connect(i,i+nx,1)}
+ function ports(g){return [[g.x-8,g.cy,g.x,g.cy,0],[g.x+BW+8,g.cy,g.x+BW,g.cy,0],[g.cx,g.y-8,g.cx,g.y,1],[g.cx,g.y+g.h+8,g.cx,g.y+g.h,1]].map(([x,y,a,b,axis])=>({id:grid(x,y),point:[a,b],axis}))}
+ const used=new Map(),lookup=new Map(nodes.map(g=>[g.id,g]));
+ const paths=[];
+ for(const e of layout.edges.sort((a,b)=>Number(a.back)-Number(b.back))){
+  const a=lookup.get(e.from),b=lookup.get(e.to),src=ports(a),dst=ports(b);
+  const dist=new Float64Array(adj.length*2).fill(Infinity),prev=new Int32Array(dist.length).fill(-1),heap=[];
+  function push(key,v){let i=heap.length;heap.push([key,v]);while(i){const p=(i-1)>>1;if(heap[p][0]<=key)break;heap[i]=heap[p];i=p}heap[i]=[key,v]}
+  function pop(){const top=heap[0],last=heap.pop();if(heap.length){let i=0;while(i*2+1<heap.length){let k=i*2+1;if(k+1<heap.length&&heap[k+1][0]<heap[k][0])k++;if(heap[k][0]>=last[0])break;heap[i]=heap[k];i=k}heap[i]=last}return top}
+  for(const p of src){const k=2*p.id+p.axis;dist[k]=0;push(0,k)}
+  let finish=-1,endPort,best=Infinity;
+  while(heap.length){const [cost,key]=pop();if(cost!==dist[key])continue;if(cost>=best)break;
+   const u=key>>1,dir=key%2;
+   for(const p of dst)if(p.id===u){const total=cost+(dir===p.axis?0:24);if(total<best){finish=key;best=total;endPort=p}}
+   for(const [v,axis,len] of adj[u]){const k=v*2+axis,seg=Math.min(u,v)*adj.length+Math.max(u,v),occupied=used.get(seg);
+    const extra=occupied&&occupied!==e.from?5+len*.48:0,newCost=cost+len+(dir!==axis?23:0)+extra;
+    if(newCost<dist[k]){dist[k]=newCost;prev[k]=key;push(newCost,k)}
+   }
+  }
+  if(finish<0)throw Error("无法布线 "+e.from+" → "+e.to);
+  const ids=[];for(let k=finish;k>=0;k=prev[k])ids.push(k>>1);ids.reverse();
+  ids.slice(1).forEach((v,i)=>used.set(Math.min(v,ids[i])*adj.length+Math.max(v,ids[i]),e.from));
+  const points=[src.find(p=>p.id===ids[0]).point,...ids.map(xy),endPort.point],simple=[];
+  for(const p of points){const l=simple.length;if(l>=2&&((simple[l-2][0]===p[0]&&simple[l-1][0]===p[0])||(simple[l-2][1]===p[1]&&simple[l-1][1]===p[1])))simple.pop();simple.push(p)}
+  paths.push({...e,d:"M"+simple.map(p=>p.join(" ")).join(" L")})
+ }
+ return paths
+}
+function drawExecutionMap(){
+ const root=el("graph"),c=cfg,z=M.z;
+ const layout=groupLayout(),sig=layout.items.map(g=>g.id+":"+g.h).join(",")+layout.edges.map(e=>e.from+e.to+e.back).join();
+ if(layoutCache?.sig!==sig)layoutCache={sig,paths:routeMap(layout)};
+ root.replaceChildren();root.style.width=(100*zoom)+"%";root.setAttribute("viewBox","0 0 "+W+" "+layout.height);
+ const defs=tag("defs",{},root);
+ for(const [id,col] of [["wire","#384541"],["loopArrow","#ab611f"],["hotArrow","#08735c"]]){const mk=tag("marker",{id,markerWidth:7,markerHeight:7,refX:6,refY:3.5,orient:"auto",markerUnits:"userSpaceOnUse"},defs);tag("path",{d:"M0 0 L7 3.5 L0 7 L1.5 3.5Z",fill:col},mk)}
+ const grid=tag("pattern",{id:"paperGrid",width:16,height:16,patternUnits:"userSpaceOnUse"},defs);tag("path",{d:"M16 0 H0 V16",fill:"none",stroke:"#e9efec","stroke-width":1},grid);
+ tag("rect",{width:W,height:layout.height,fill:"url(#paperGrid)"},root);
+ const strips={Q:matrixStrip(root,"Q",X0,355,"#cfe3ff","#4579b2"),K:matrixStrip(root,"K",X0+2*DX,355,"#ffe0d4","#b76551"),V:matrixStrip(root,"V",X0+4*DX,355,"#dcf0dc","#478659")};
+ const activeGroup=ownerOf(selected),chosen=prog.find(n=>n.id===selected);
+ for(const [kind,key] of [["Q","ldq"],["K","ldk"],["V","ldv"]]){const g=layout.items.find(x=>x.id===key);
+  const strip=strips[kind];tag("path",{"data-operand":kind,d:"M"+strip.port.join(" ")+" V128 H"+(strip.x+295)+" V159 H"+g.cx+" V"+g.y,fill:"none",stroke:"#384541","stroke-width":1.4,"marker-end":"url(#wire)"},root)
+ }
+ const paths=layoutCache.paths;
+ for(const p of [...paths].sort((a,b)=>Number(a.to===activeGroup||a.from===activeGroup)-Number(b.to===activeGroup||b.from===activeGroup))){
+  const hi=!p.back&&(p.to===activeGroup||p.from===activeGroup);
+  const line=tag("path",{"data-dep":p.from+"/"+p.to,"data-carried":p.back,d:p.d,fill:"none",stroke:p.back?"#ab611f":hi?"#08735c":"#384541","stroke-width":hi?2.1:1.25,"stroke-dasharray":p.back?"6 3":"none","marker-end":"url(#"+(p.back?"loopArrow":hi?"hotArrow":"wire")+")"},root);tag("title",{},line,p.info.join("\n"))
+ }
+ for(const g of layout.items){
+  const a=tag("g",{"data-box":g.id,transform:"translate("+g.x+","+g.y+")"},root);
+  const main=g.nodes.find(u=>u.id===g.id)||g.nodes[0],any=g.nodes.some(n=>n.cnt>0),hot=g.id===activeGroup;
+  const color=palette[main.en][0];
+  tag("rect",{width:BW,height:g.h,fill:hot?"#ecf6f0":"white",stroke:hot?"#08735c":"#273833","stroke-width":hot?2:1.5},a);
+  const top=tag("g",{class:"node"},a);
+  tag("rect",{width:BW,height:55,fill:"transparent"},top);
+  const engines=[...new Set(g.nodes.map(n=>n.en))].join("/");
+  tag("text",{x:8,y:13,fill:color,"font-size":10,"font-weight":650},top,engines+" · "+(g.nodes.length===1?main.mn:g.nodes.length+" 条 IR"));
+  tag("text",{x:8,y:32,fill:"#152b25","font-size":16,"font-weight":650},top,g.title);
+  tag("text",{x:8,y:48,fill:any?"#3f554c":"#76857e","font-size":10.8},top,g.note);
+  tag("text",{x:BW-7,y:14,fill:"#4c6359","text-anchor":"end","font-size":12},top,g.expanded?"−":"+");
+  svgButton(top,()=>{if(hot){if(!showIR){if(openBoxes.has(g.id))openBoxes.delete(g.id);else openBoxes.add(g.id)}}selected=main.id;graph()},g.title+"，选择或展开指令");
+  if(g.expanded)g.nodes.forEach((u,i)=>{const yy=57+i*22,elt=tag("g",{"data-ir":u.id,class:"node"},a);
+   tag("rect",{x:1,y:yy,width:BW-2,height:21,fill:u.id===selected?"#c8e9d8":"#fff",stroke:"#e2e7e3","stroke-width":.5},elt);
+   tag("text",{x:5,y:yy+14,"font-size":10.7,fill:u.cnt?palette[u.en][0]:"#788782"},elt,u.mn+"  "+u.title);
+   tag("title",{},elt,u.en+" · "+u.asm+" · 本块 "+u.cnt+" 条\n依赖 "+u.parents.join(", "));svgButton(elt,()=>{selected=u.id;graph()},u.mn+" "+u.title)
+  })
+ }
+ const maxBox=layout.items.find(g=>g.id==="max");
+ const x=maxBox.x+BW*.65, y=maxBox.y;
+ const carry=tag("path",{"data-dep":"max/max","data-carried":true,d:"M"+x+" "+y+" v-11 h-31 v11",stroke:"#ab611f","stroke-width":1.5,"stroke-dasharray":"4 2",fill:"none","marker-end":"url(#loopArrow)"},root);
+ tag("title",{},carry,"上一 KV 块最大值 m′ → 下一 KV 块 m_old");
+ // Expanded IR shares the same canvas. Trace selected register dependencies to the actual instruction rows.
+ const positions=new Map();
+ for(const g of layout.items)if(g.expanded)g.nodes.forEach((u,i)=>positions.set(u.id,{x:g.x,y:g.y+68+22*i,g}));
+ if(positions.has(selected)){
+  const pairs=[];for(const v of prog)for(const p of v.parents)if(v.id===selected||p===selected)pairs.push([p,v.id]);
+  for(const [src,dst] of pairs){
+   const a=positions.get(src),b=positions.get(dst);if(!a||!b)continue;
+   const rightA=a.x+BW,rightB=b.x+BW;
+   const wire=paths.find(e=>e.from===a.g.id&&e.to===b.g.id);
+   // Within-box edges use the outer rail. Across boxes the group route already carries the signal.
+   if(a.g===b.g){
+    const d="M"+rightA+" "+a.y+" h7 V"+b.y+" H"+rightB;
+    tag("path",{d,stroke:"#08735c","stroke-width":1.4,fill:"none","marker-end":"url(#hotArrow)","pointer-events":"none"},root)
+   }else if(wire){
+    for(const pt of [a,b])tag("circle",{cx:pt.x+BW-3,cy:pt.y,r:3,fill:"#08735c","pointer-events":"none"},root)
+   }
+  }
+ }
+ const note=tag("g",{},root);tag("text",{x:X0,y:layout.height-11,"font-size":12,fill:"#965117"},note,"跨 KV 块回边：m′ → m_old，ℓ′ → ℓ_old，U′ → U_old。首块初始化；末块写出 O / LSE。");
+ el("detail").textContent=showIR?"收起 IR 明细":"展开全部 IR";el("detail").setAttribute("aria-pressed",showIR)
+}
+el("detail").onclick=()=>{showIR=!showIR;openBoxes.clear();graph()};
+function wideCanvas(on){el("flow").classList.toggle("mapwide",on);el("wide").textContent=on?"还原画布":"放大画布";el("wide").setAttribute("aria-pressed",String(on))}
+el("wide").onclick=()=>wideCanvas(!el("flow").classList.contains("mapwide"));document.addEventListener("keydown",e=>{if(e.key==="Escape")wideCanvas(false)});
+function setZoom(factor){zoom=clamp(factor,.55,3);graph()}
+el("more").onclick=()=>setZoom(zoom*1.2);el("less").onclick=()=>setZoom(zoom/1.2);el("fit").onclick=()=>setZoom(1);
+
+function graph(){
+ drawExecutionMap();
+ const chosenNode=prog.find(u=>u.id===selected)||prog[0],box=el("focus");box.replaceChildren();
+ const h=document.createElement("h3");h.textContent=chosenNode.title+" · "+chosenNode.en;box.append(h);
+ const desc=document.createElement("p");desc.className="num";desc.textContent=chosenNode.mn+"   "+chosenNode.asm;box.append(desc);
+ const count=document.createElement("p");count.textContent="当前块 "+num(chosenNode.cnt)+" 条"+(chosenNode.mn.startsWith("WAIT")?"等待指令。实际停顿取决于事件就绪时刻。":"。")+chosenNode.note;box.append(count);
+ for(const [label,list] of [["输入依赖",chosenNode.parents],["结果去向",prog.filter(u=>u.parents.includes(chosenNode.id)).map(u=>u.id)]]){
+  if(!list.length)continue;const row=document.createElement("div");row.append(label+"　");
+  for(const id of list){const u=prog.find(v=>v.id===id);if(!u)continue;const b=document.createElement("button");b.textContent=u.title;b.onclick=()=>{pickInstruction(id,true)};row.append(b)}box.append(row)
+ }
+}
+function stepInstruction(dir){
+ stop();
+ const active=prog.filter(x=>x.cnt>0);
+ let ix=active.findIndex(x=>x.id===selected);
+ if(ix<0)ix=dir>0?-1:active.length;
+ let dest=active[ix+dir];
+ if(!dest){
+  if(el(dir>0?"next":"prev").disabled)return;
+  move(dir);
+  const list=prog.filter(x=>x.cnt>0);
+  dest=dir>0?list[0]:list.at(-1)
+ }
+ pickInstruction(dest.id,true)
+}
+function renderTile(){
+ const z=M.z;outer=clamp(outer,0,z.blocks.length-1);const b=z.blocks[outer];part=clamp(part,0,b.s-1);
+ const steps=Math.floor((part+1)*b.count/b.s)-Math.floor(part*b.count/b.s);step=clamp(step,0,steps-1);
+ tile=tileData(cfg,z,outer,part,step);
+ tileSlider("outer",outer,z.blocks.length-1);tileSlider("part",part,b.s-1);tileSlider("step",step,steps-1);
+ el("loopid").textContent="Q ["+b.begin+", "+b.end+")  ×  KV ["+tile.k0+", "+tile.k1+")";
+ el("tilenote").textContent="每个 Q 工作组扫描 "+b.count+" 个 KV 块；分区内逆序。当前 "+num(tile.valid)+" / "+num(cfg.m*z.n)+" 个有效槽"+(tile.first?" · 首块初始化":" · 读取历史状态")+(tile.last?" · 分区收尾":"")+"。";
+ el("prev").disabled=!outer&&!part&&!step;el("next").disabled=outer===z.blocks.length-1&&part===b.s-1&&step===steps-1;
+ prog=expand(instructions(cfg,z,tile),cfg,tile,z);if(!prog.some(u=>u.id===selected))selected="qk";graph()
+}
+function syncResources(){
+ const c=cfg,z=M.z,t=M.t,rt=refModel.t;
+ const perfRows=[
+ ["Tensor QK",num(M.qk),num(M.qk/t/1e6,3)+" TFLOP/s","—","共享阵列",num(M.qk/M.f*100,1)+"%","—"],
+ ["Tensor PV",num(M.pv),num(M.pv/t/1e6,3)+" TFLOP/s","—","共享阵列",num(M.pv/M.f*100,1)+"%","—"]
+ ];
+ const times=[["Tensor QK+PV",t],["外存读写",M.memUs],["共享 SRAM 读",M.srR/(c.sr*1000)],["共享 SRAM 写",M.srW/(c.sw*1000)]];
+ for(const [id,op] of Object.entries(M.work)){
+  const gr=op/t/1000,input=document.createElement("input");input.type="number";input.min=1;input.max=100000;input.step="any";input.className="cap";input.value=unitCaps[id];input.setAttribute("aria-label",id+" 供给 G/s");
+  input.onchange=()=>{if(!input.value||!input.checkValidity()){input.value=unitCaps[id];return}unitCaps[id]=+input.value;syncResources()};
+  const utilization=gr/unitCaps[id],cell=document.createElement("span");cell.className="util";cell.style.setProperty("--pct",Math.min(100,100*utilization)+"%");cell.style.setProperty("--fill",utilization>1?"#eac7ae":"#c9e2d5");cell.textContent=num(100*utilization,1)+"%";
+  perfRows.push([id,num(op),num(gr,3)+" G/s",op?num(M.f/op)+" ∶ 1":"—",input,cell,delta(gr,(refModel.work[id]||0)/rt/1000,3)]);
+  times.push([id,op/(unitCaps[id]*1000)])
+ }
+ table("compute",["引擎 / 单元","整层 FLOP 或次","平均需求","Tensor FLOP ∶ 次","供给 G/s","需求 / 供给","Δ G/s"],perfRows);
+ const bw=[];for(const [name,[rd,wr]] of Object.entries(M.traffic)){
+  const [pr,pw]=refModel.traffic[name];bw.push([name,bytes(rd),bytes(wr),num(rd/t/1000,3),num(wr/t/1000,3),delta((rd+wr)/t/1000,(pr+pw)/rt/1000,3)])
+ }
+ table("band",["边界","读量","写量","读 GB/s","写 GB/s","Δ 总 GB/s"],bw);
+ const [tr,tw]=M.traffic["S/P 交接 · Tensor"],[vr,vw]=M.traffic["S/P 交接 · Vector"];
+ el("ratio").textContent=cfg.bridge==="sram"?"S/P 交接的 Tensor ∶ Vector　读口 "+num(tr/t/1000)+" ∶ "+num(vr/t/1000)+" GB/s　｜　写口 "+num(tw/t/1000)+" ∶ "+num(vw/t/1000)+" GB/s。":"S/P 使用寄存器或直连。交接的 SRAM 事务为零，片段读写仍消耗内部端口。";
+ times.sort((a,b)=>b[1]-a[1]);table("limits",["资源","服务下界 µs","相对 Tensor 时间"],times.filter(x=>x[1]>0).map(([k,v])=>[k,num(v,5),num(v/t,2)+" ×"]));
+ el("bottleneck").textContent="最大资源下界为 "+times[0][0]+"，"+num(times[0][1],5)+" µs。假设各单元可重叠；等待、发射、控制和占用率会增加实际时间。";
+}
+function render(){
+ M=estimate(cfg);refModel=estimate(saved);const c=cfg,z=M.z;
+ el("mode").textContent="M "+c.m+"  ×  N "+z.n+"　/　d "+c.dk+" · "+c.dv;
+ el("scope").textContent="单请求 · "+c.hq+" Q 头 / "+c.hk+" KV 头";
+ const top=[["Tensor 工作量",num(M.f/1e6,2),"MFLOP","QK + PV"],["有效配对占比",num(z.valid/z.A*100,2),"%","含因果边界与填充"],["外存目标带宽",num(M.effBW/1000,3),"TB/s","按 Tensor 目标折算"],["指数吞吐需求",num(M.work.EXP/M.t/1000,2),"G/s",c.isa==="base2"?"EX2 · 含行系数":"EXP · 含行系数"]];
+ el("metrics").innerHTML=top.map(([label,v,u,sub])=>'<div class="metric"><span>'+label+'</span><b>'+v+' <small>'+u+'</small></b><small>'+sub+'</small></div>').join("");
+ const zr=refModel.z, rr=[["执行 score 槽 A",num(z.A),num(zr.A)],["有效配对数",num(z.valid),num(zr.valid)],["KV tile 访问 / 分区工作项",num(z.scans)+" / "+num(z.ctas),num(zr.scans)+" / "+num(zr.ctas)],["行块访问 J / 重标次数 H",num(z.J)+" / "+num(z.H),num(zr.J)+" / "+num(zr.H)],["KV 每次装填服务的有效 Q 行",num(M.ks,3),num(refModel.ks,3)],["外存每个 KV token 服务的有效 Q 行",num(M.effReuse,3),num(refModel.effReuse,3)],["Q 源读取 / 阵列片段装填",bytes(M.srcQ)+" / "+bytes(M.feedQ),bytes(refModel.srcQ)+" / "+bytes(refModel.feedQ)],["页表覆盖量（每 Q 块内去重）",num(z.pages)+" 项",num(zr.pages)+" 项"],["QK head 切片数",num(M.sliced),num(refModel.sliced)],["每工作项片上数据估算",bytes(M.live),bytes(refModel.live)]];
+ table("reuse",["指标","当前","对照"],rr);el("ref").textContent="当前对照："+savedName;
+ el("capacity").textContent="合计 Q、"+c.buffers+" 份 K/V、S、P、U 及 m/ℓ 的同时存活量约 "+bytes(M.live)+"。预算 "+num(c.cap)+" KiB："+(M.live<=c.cap*1024?"可容纳约 "+Math.floor(c.cap*1024/M.live)+" 组此布局。":"超出 "+bytes(M.live-c.cap*1024)+"，当前驻留假定需调整。")+" RF 和 SRAM 合并估算，未自动执行溢写。";
+ renderTile();syncResources();sensitivity()
+}
+</script>
+<script>
+fields[1][1].push(["meta","页表读量","off",["off|单列估算","on|计入冷外存"]],["red","归约后端","unit",["unit|专用 RED 单元","tree|SHFL + MAX/ADD"]]);
+for(const c of [base,configs.decode,configs.short,cfg,saved]){c.meta="off";c.red="unit"}
+unitCaps.SHFL=1000;
+function inputAtoms(c){const k=c.hs==="full"?c.dk:+c.hs;return Math.floor(c.dk/k)*ceil(k/c.ka)+ceil((c.dk%k)/c.ka)}
+function operandBytes(u,c,t,z){
+ const id=u.id,ct=u.cnt;if(!ct)return [0,0];
+ const keys=t.k1-t.k0,rows=t.b.rows,vec=c.m*z.n,out=c.m*c.dv,split=t.b.s;
+ const copy=n=>[n,n], per=(a,b)=>[ct*a,ct*b];
+ if(u.en==="Control")return [0,0]; // data-plane operands only
+ if(id==="commit")return [0,0];
+ if(id==="ptab")return copy(4*ct);
+ if(id==="ldq")return copy(rows*c.dk*c.bq);
+ if(id==="ldk")return copy(keys*c.dk*c.bk);
+ if(id==="ldv")return copy(keys*c.dv*c.bv);
+ if(id==="writeO")return copy(rows*c.dv*(split>1?4:c.bo));
+ if(id==="writeL"||id==="mergeStore")return copy(rows*4);
+ if(id==="readParts")return copy(rows*split*(c.dv+1)*4);
+ if(id==="mergeStoreO")return copy(rows*c.dv*c.bo);
+ if(id==="qk"||id==="pv"){const p=id==="qk"?c.bq:c.bp,v=id==="qk"?c.bk:c.bv;return per(c.ma*c.ka*p+c.ka*c.na*v+c.ma*c.na*4,c.ma*c.na*4)}
+ if(id==="clearS"||id==="clearU")return per(0,c.ma*c.na*4);
+ if(["tq","tk","tp","tv"].includes(id))return copy(ct*({tq:c.ma*c.ka*c.bq,tk:c.na*c.ka*c.bk,tp:c.ma*c.ka*c.bp,tv:c.na*c.ka*c.bv})[id]);
+ if(["ldpartial","spill","sendS","saveU","restoreU"].includes(id))return copy(ct*c.ma*c.na*4);
+ const red=id.match(/^(rmax|rsum|mergeMax|mergeSum)(?:_(sh|op)(\d+))?$/);
+ if(red){
+  const isMerge=red[1].startsWith("merge"),n=isMerge?split:z.n,r=isMerge?rows:c.m;
+  if(u.mn.includes("RED"))return [4*(r*n+ct-r),4*ct];
+  if(u.mn==="V.MOV")return per(4,4);
+  if(u.title==="合并分区归约段")return per(8,4);
+  const k=red[3]?Number(red[3]):2**(ceil(Math.log2(Math.min(n,c.lanes)))-1);
+  let pairs=0;for(let j=0;j<n;j+=c.lanes)pairs+=Math.floor((Math.min(n-j,c.lanes)+k-1)/(2*k));
+  return [pairs*r*(u.mn==="V.SHFL.DOWN"?4:8),pairs*r*4]
+ }
+ if(["loadU","putU","lastLoadU"].includes(id))return copy(out*4);
+ if(id==="stp")return copy(vec*c.bp);
+ if(id==="cvtp")return [vec*4,vec*c.bp];
+ if(id==="cvto"||id==="mergeCvt")return [rows*c.dv*4,rows*c.dv*c.bo];
+ if(id==="ldS"||id==="reload")return copy(vec*4);
+ if(id==="scU"||id==="norm")return [(out+ct)*4,out*4];
+ if(id==="mergeMul")return [(rows*split*c.dv+ct)*4,rows*split*c.dv*4];
+ if(id==="mergeAdd")return [rows*(split-1)*c.dv*8,rows*(split-1)*c.dv*4];
+ if(id==="cmp")return [4*(vec+ct),ceil(vec/8)];
+ if(id==="mask"||id==="remask")return [4*vec+ceil(vec/8),4*vec];
+ if(id==="badmax"||id==="zeroL")return [4*ct,ceil(ct/8)];
+ if(id==="safeMax"||id==="safeL")return [4*ct+ceil(ct/8),4*ct];
+ if(["center","scale","rescale"].includes(id))return [4*(vec+(id==="center"?ct:0)),4*vec];
+ if(id.startsWith("mergeSub")||id.startsWith("mergeScale"))return [4*(rows*split+ct),4*rows*split];
+ if(id.startsWith("mergeExp"))return copy(rows*split*4);
+ if(id.startsWith("exp"))return copy(vec*4);
+ if(["segmax","segsum","max","delta","scaleL","sum","lse","mergeLse"].includes(id))return per(8,4);
+ return per(4,4)
+}
+function unitOf(u){
+ if(u.mn.startsWith("WAIT")||u.mn==="BAR.SYNC")return "等待 / 同步";
+ if(u.mn.includes("RED"))return u.mn.includes("MAX")?"REDMAX":"REDSUM";
+ if(u.mn.includes("MMA"))return "矩阵 MAC";
+ if(u.mn.includes("ROW"))return "行乘";
+ const key=u.mn.split(".")[1]||u.mn;
+ return ({ADD:"ADD",SUB:"SUB",MUL:"MUL",EXP:"EXP",EX2:"EXP2",LG2:"LOG2",LOG:"LOG",CVT:"CVT",RCP:"RCP",SHFL:"SHUFFLE",SEL:"SELECT",CMP:"CMP",MAX:"MAX"})[key]||u.mn
+}
+function sensitivity(){
+ let box=el("sweep");
+ if(!box){box=document.createElement("section");box.id="sweep";box.className="panel";
+ box.innerHTML='<div class="bar"><h2>参数扫描</h2><label>只改变一项 <select id="scanKey"><option value="n">KV 块宽 N</option><option value="m">Q 块行数 M</option><option value="dk">Q/K 头维 dₖ</option><option value="dv">V 头维 dᵥ</option><option value="red">归约后端</option><option value="uplace">累加器重标位置</option></select></label></div><div class="scroll" id="scanTable"></div><p class="hint">沿用当前请求和其余参数。N 设为自动时，扫描 dₖ 会同时触发 FA2 的 N 选择规则。</p>';
+ el("resources").after(box);el("scanKey").onchange=sensitivity}
+ const k=el("scanKey").value,opts={n:[32,64,128,256],m:[16,32,64,128],dk:[64,128,192,256],dv:[64,128,256,512],red:["unit","tree"],uplace:["rf","sram","tensor"]};
+ const names={rf:"共享 RF",sram:"SRAM 往返",tensor:"累加器侧",unit:"专用 RED",tree:"SHFL + ALU"};
+ const rows=opts[k].map(v=>{const c={...cfg,[k]:v},x=estimate(c);
+ return [names[v]||v,c.m+" × "+x.z.n,num(x.ks,2),bytes(x.srcQ)+" / "+bytes(x.feedQ),num(x.dram/x.t/1000,2),num(x.srR/x.t/1000,2)+" / "+num(x.srW/x.t/1000,2),num(x.work.MUL/x.t/1000,2),num(x.work.EXP/x.t/1000,2),num(x.work.REDMAX/x.t/1000,2)]});
+ table("scanTable",["参数值","M × N","KV 有效行复用","Q 源读 / 阵列读","外存 GB/s","SRAM 读 / 写 GB/s","MUL G/s","EXP G/s","REDMAX G/s"],rows)
+}
+function listing(){
+ let strip=el("instrNav");if(!strip){strip=document.createElement("div");strip.id="instrNav";strip.className="controls";strip.innerHTML='<button id="prevInst">← 上一条有效指令</button><button id="nextInst">下一条有效指令 →</button><span class="hint">跨块继续 · 跳过本块执行次数为零的节点</span>';el("focus").after(strip);el("prevInst").onclick=()=>stepInstruction(-1);el("nextInst").onclick=()=>stepInstruction(1)}
+ let d=el("listing");if(!d){d=document.createElement("details");d.id="listing";d.innerHTML='<summary>展开逐条参考汇编清单与整层指令配比</summary><p class="hint">整层动态条数按全部工作组计；向量以一段 VL 为一条，归约树的每级 shuffle 与比较或加法分别计。重复站点代表卷展的同类指令。等待的需求单位为事件等待次数。</p><div class="scroll" id="asmTable"></div>';strip.after(d)}
+ if(!d.open){d.ontoggle=()=>{if(d.open)listing()};return}
+ if(!M.totalInst)M.totalInst=instructionTotals(cfg,M.z);
+ table("asmTable",["阶段","引擎 / 单元","RISC IR 指令","操作","本块条数","整层条数","Tensor FLOP ∶ 条","整层读 / 写量","操作数读 / 写 GB/s"],prog.map(u=>{const value=M.totalInst.get(u.id)||0,[rd,wr]=M.totalInst.bytes.get(u.id)||[0,0];return [stages[u.st],u.en+" / "+unitOf(u),u.mn,u.title,num(u.cnt),num(value),value?num(M.f/value,2)+" ∶ 1":"—",bytes(rd)+" / "+bytes(wr),num(rd/M.t/1000,2)+" / "+num(wr/M.t/1000,2)]}))
+}
+function instructionTotals(c,z){
+ const classes=new Map(),total=new Map();total.bytes=new Map();
+ z.blocks.forEach((b,outerIdx)=>{
+  const boundary=Math.floor((c.causal==="yes"?c.p+Math.floor(b.begin/z.factor)+1:z.L)/z.n);
+  for(let pi=0;pi<b.s;pi++){
+   const lo=Math.floor(pi*b.count/b.s),hi=Math.floor((pi+1)*b.count/b.s);
+   const cuts=[...new Set([lo,lo+1,hi-1,hi,hi-c.buffers,boundary,ceil(z.L/z.n)-1].filter(x=>x>=lo&&x<=hi))].sort((a,b)=>a-b);
+   for(let i=0;i<cuts.length-1;i++){
+    const k=cuts[i],steps=hi-1-k,first=k===hi-1,last=k===lo,merge=last&&pi===b.s-1&&b.s>1;
+    const pages=ceil(Math.min(z.L,(k+1)*z.n)/c.page)-Math.floor(k*z.n/c.page);
+    const key=[b.rows,b.s,+first,+last,+merge,+(k>=boundary),+(steps>=c.buffers),pages,Math.min(z.n,z.L-k*z.n)].join("/");
+    const weight=(cuts[i+1]-k)*z.copies;
+    let group=classes.get(key);
+    if(!group){group={t:tileData(c,z,outerIdx,pi,steps),weight:0};classes.set(key,group)}
+    group.weight+=weight
+   }
+  }
+ });
+ for(const {t,weight} of classes.values()){
+  const row=expand(instructions(c,z,t),c,t,z);
+  for(const u of row){
+   total.set(u.id,(total.get(u.id)||0)+weight*u.cnt);
+   const old=total.bytes.get(u.id)||[0,0],v=operandBytes(u,c,t,z);
+   total.bytes.set(u.id,[old[0]+weight*v[0],old[1]+weight*v[1]])
+  }
+ }
+ return total
+}
+const renderGraph=graph;
+graph=function(){renderGraph();const u=prog.find(v=>v.id===selected);if(u){const [rd,wr]=operandBytes(u,cfg,tile,M.z),info=document.createElement('div');info.className='unitstats';info.textContent='执行单元 '+unitOf(u)+'　·　当前块数据操作数　读 '+bytes(rd)+'　/　写 '+bytes(wr);el('focus').append(info)}listing()};
+el("preset").onchange=()=>{if(!configs[el("preset").value])return;stop();cfg={...configs[el("preset").value]};outer=part=step=0;sync();el("err").textContent="";render()};
+el("reset").onclick=()=>{el("preset").value="base";el("preset").onchange()};
+el("pin").onclick=()=>{saved={...cfg};savedName="M"+cfg.m+" × N"+M.z.n+"，d="+cfg.dk+"/"+cfg.dv+"，q="+cfg.q+"，p="+cfg.p;render()};
+el("next").onclick=()=>{stop();move(1)};el("prev").onclick=()=>{stop();move(-1)};
+el("play").onclick=()=>{if(timer!==null){stop();return}if(el("next").disabled){outer=part=step=0;renderTile()}el("play").textContent="暂停";timer=setInterval(()=>move(1),850)};
+document.addEventListener("visibilitychange",()=>{if(document.hidden)stop()});
+
+el("assumptions").innerHTML='<p><b>范围与计数。</b> 单请求、全部 Q/KV 头的标准前向；QKV 投影、RoPE、cache 追加在边界外。基线取 vLLM v0.11.2 分页 FA2 的 M=64，N 按 dₖ 选择。更换块形状、驻留、精度和分区代表设计假设。输入字节控制搬运宽度，S、U、行统计和 split 中间值固定 FP32；低精度量化格式的 scale、溢出处理需按具体格式另计。</p><p><b>指令口径。</b> 图中每个节点是一条参考 ISA 指令位置，重复条数属于所选 Q 块、分区、KV 步；各操作框可在同一画布就地展开 IR。Tensor 用可调 M×N×K 原子和 FP32 累加，Vector 按 VL 的一维段执行。行标量按每行一份，归约使用显式 shuffle 与二元操作，尾部 lane 受谓词控制。块内固定次数的原子/向量循环按静态展开处理。DMA.COPY 是二维搬运描述符；Q/K/V 指针基址、输入 stride、索引向量与常数由调用方提供。WAIT 是依赖消费者的事件等待，页寻址与调度按显式控制模型展示。</p><p><b>计算式。</b> 执行槽 A=ΣMN，J=ΣM，R=各分区首次扫描的执行行数，H=J−R。有效配对按各行可见列数累加。满原子时矩阵 FLOP 为 2A(dₖ+dᵥ)，非对齐时服务时间使用实际原子容量。各项需求=工作量÷Tensor 时间。分区复算局部归一化并按局部 LSE 合并。比较/选择按边界块计，二元归约计有效归约边。指数/对数可选原生单指令或展开换底；卷入同一物理管线时应合并服务时间。</p><p><b>存储边界。</b> Q、K、V 先写共享缓冲再装填阵列，S/P 走指定交接，旧 U 按指定位置更新。页表项按每个 Q 工作组访问的不同逻辑页估算，跨 tile 的同页可重用。KV 命中率只作用于首次读取后的重复载荷；不模拟替换。跨 CTA 资源竞争、流水启动排空、寄存器溢出、实际 stall 周期与低精度编译优化未标定。容量估算按同时保留完整片段的布置。</p><p><b>与 CUDA 对照。</b> 这里的参考汇编服务于 Tensor / Vector / DMA 分工，无特定 GPU 二进制的逐 PC 反汇编。Ampere 对应指令族包括 mma.sync、ldmatrix、shfl.sync、fma.rn、ex2.approx、lg2.approx、rcp.approx、cvt、cp.async、cp.async.wait_group 和 bar.sync；实际 FA2 将部分 scale/sub 融合，并延后跨 lane 的 sum 归约。<a href="https://docs.nvidia.com/cuda/parallel-thread-execution/">NVIDIA PTX ISA</a> · <a href="kernel_sources.md">vLLM 固定提交与内核路径</a></p>';
+makeSettings();sync();render();
+
+const semantics=document.createElement('p');semantics.innerHTML='<b>IR 与后端。</b> 每个节点对应一处通用 RISC 语义操作，源、目的及依赖可映射到不同后端。专用 RED 模式用带 seed 的水平归约，树形模式展开为 SHFL 与 MAX/ADD 并重新计入对应单元。名义操作数读写量按有效数据或所选 MMA 原子片段计，每段广播读一份行系数，常数视为立即数；地址寄存器、事件与控制指令不占模型的数据端口。逐指令表里的操作数带宽包含寄存器内部访问，存储端口预算见读写带宽表。';el('assumptions').prepend(semantics);
+el('assumptions').children[2].innerHTML=el('assumptions').children[2].innerHTML.replace('归约使用显式 shuffle 与二元操作','归约采用所选 RED 或 shuffle 后端');
+</script>
+<style>
+.stageNav,.overview{display:flex;gap:5px;flex-wrap:wrap;margin:10px 0}.stageNav button{font-size:12px;padding:4px 9px}.stageNav button.on{background:#165e4d;color:white;border-color:#165e4d}.overview{background:#f1f5ef;border-radius:8px;padding:9px;gap:0}.overview button{flex:1;min-width:93px;border:0;background:transparent;text-align:left;position:relative;padding:3px 10px}.overview button:not(:nth-child(6)):after{content:"→";position:absolute;right:-3px;top:10px;color:#649283}.overview small,.overview b{display:block}.overview b{font-family:Consolas,"Microsoft Yahei",monospace;font-size:15px}.loopback{width:100%;border-top:1px dashed #95bab0;margin-top:7px;padding:5px 9px 0;color:#486b5d;font-size:12px}.cap{max-width:84px}.metric b small{font-weight:500;font-size:11px;white-space:nowrap}.side .hint{margin:8px 0 0}#listing{margin-top:12px}#listing summary{color:#43655b;font-size:13px}#asmTable td:nth-child(4){font-family:Consolas,monospace;text-align:left}#assumptions p{margin:10px 0}#focus{min-height:106px}button:focus-visible,.graph g:focus-visible{outline:2px solid #a86620;outline-offset:1px}
+.util{display:inline-block;padding:1px 5px;min-width:72px;text-align:center;border-radius:4px;background:linear-gradient(90deg,var(--fill) var(--pct),#f1f4f1 var(--pct))}
+#payload{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));margin-top:11px;border-top:1px solid var(--line);padding-top:8px;gap:7px}#payload b,#payload small{display:block}#payload b{font:600 15px/1.5 Consolas,monospace;color:#195e4c}#payload small{font-size:11px}.unitstats{font:13px/1.7 Consolas,"Microsoft YaHei",monospace;margin-top:5px;color:#175d49}@media(max-width:700px){#payload{grid-template-columns:repeat(2,minmax(0,1fr))}}
+.maptools{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:6px;margin:10px 0 2px}.maptools .controls{margin:0}#flow #loop{background:#f5f8f5;border:1px solid #dae5dc;border-radius:8px;padding:7px 13px;margin:10px 0}#flow .loopgrid{max-width:none}#flow .graphscroll{margin:8px 0;overflow-x:auto;border:1px solid #d3ddd6;border-radius:4px}#graph.graph{min-width:0}#loop .hint{margin:0}.graph .node:hover>rect:first-child{stroke:#14755e}.maptools .legend{font-size:11px}#flow.mapwide{position:fixed;inset:0;z-index:20;margin:0;border-radius:0;overflow:auto;padding:16px max(16px,3vw);background:white}body:has(#flow.mapwide){overflow:hidden}
+</style></body></html>
