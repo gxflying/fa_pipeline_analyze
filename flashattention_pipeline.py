@@ -22,6 +22,40 @@ ENGINE_RESOURCES = {
     "Vector": VECTOR_UNITS + ("VECTOR_LD", "VECTOR_ST"),
     "DMA": ("DMA_RD", "DMA_WR"),
 }
+# 同一资源上的操作以标签区分，带波浪号的量是后续加法的中间结果。
+ATTENTION_EQUATIONS = {
+    "QK": r"X_j = QK_j^{\mathsf{T}}",
+    "SCALE": r"S_j = X_j/\sqrt{d_k} + \mathrm{mask}_j",
+    "ROWMAX": r"r_j = \mathrm{rowmax}(S_j)",
+    "MAX": r"m_j = \max(m_{j-1}, r_j)",
+    "SUB_S": r"U_j = S_j-m_j",
+    "DELTA": r"\Delta m_j = m_{j-1}-m_j",
+    "EXP_P": r"P_j = \exp(U_j)",
+    "ALPHA": r"\alpha_j = \exp(\Delta m_j)",
+    "ROWSUM": r"z_j = \mathrm{rowsum}(P_j)",
+    "PV": r"Y_j = P_jV_j",
+    "SCALE_L": r"\widetilde{\ell}_j = \alpha_j\ell_{j-1}",
+    "ADD_L": r"\ell_j = \widetilde{\ell}_j+z_j",
+    "SCALE_A": r"\widetilde{A}_j = \alpha_j A_{j-1}",
+    "ADD_A": r"A_j = \widetilde{A}_j+Y_j",
+    "CVT_S": r"S_j^{(\mathrm{V})} = \mathrm{cast}(S_j)",
+    "CVT_P": r"P_j^{(\mathrm{T})} = \mathrm{cast}(P_j)",
+    "CVT_Y": r"Y_j^{(\mathrm{V})} = \mathrm{cast}(Y_j)",
+}
+FORMAT_BYTES = {"fp16": 2, "bf16": 2, "fp32": 4}
+NUMERIC_DEFAULTS = {
+    "tensor_input_dtype": "bf16",
+    "tensor_output_dtype": "fp32",
+    "vector_dtype": "fp32",
+    "ddr_k_dtype": "tensor",
+    "ddr_v_dtype": "tensor",
+    "conversion": {
+        "mode": "explicit",
+        "vector_load_extra_cycles": 2,
+        "vector_store_extra_cycles": 2,
+        "dma_extra_cycles": 2,
+    },
+}
 
 
 def validate_config(config):
@@ -34,6 +68,9 @@ def validate_config(config):
                 raise ValueError(f"{path} 的键必须为 {list(reference)}")
             for key in reference:
                 check(value[key], reference[key], f"{path}.{key}")
+        elif isinstance(reference, str):
+            if not isinstance(value, str):
+                raise ValueError(f"{path} 必须是字符串")
         elif isinstance(reference, bool):
             if not isinstance(value, bool):
                 raise ValueError(f"{path} 必须是布尔值")
@@ -44,12 +81,50 @@ def validate_config(config):
         elif isinstance(reference, int) and not isinstance(value, int):
             raise ValueError(f"{path} 必须是整数")
 
-    check(config, template, "config")
+    if not isinstance(config, dict):
+        raise ValueError("config 必须是对象")
+    check({key: value for key, value in config.items() if key != "numeric"}, template, "config")
+    if "numeric" in config:
+        numeric = config["numeric"]
+        check(numeric, NUMERIC_DEFAULTS, "config.numeric")
+        for key in ("tensor_input_dtype", "tensor_output_dtype", "vector_dtype",
+                    "ddr_k_dtype", "ddr_v_dtype"):
+            allowed = set(FORMAT_BYTES)
+            if key.startswith("ddr_"):
+                allowed.add("tensor")
+            if numeric[key] not in allowed:
+                raise ValueError(f"numeric.{key} 必须是 {sorted(allowed)} 中的一项")
+        conversion = numeric["conversion"]
+        if conversion["mode"] not in ("explicit", "inline"):
+            raise ValueError("numeric.conversion.mode 必须为 explicit 或 inline")
+        for key in ("vector_load_extra_cycles", "vector_store_extra_cycles", "dma_extra_cycles"):
+            if conversion[key] not in (1, 2):
+                raise ValueError(f"numeric.conversion.{key} 必须为 1 或 2")
+        if conversion["mode"] == "explicit" and any(
+                numeric[key] not in ("tensor", numeric["tensor_input_dtype"])
+                for key in ("ddr_k_dtype", "ddr_v_dtype")):
+            raise ValueError("DDR K/V 与 Tensor 格式不同时需要 inline DMA 转换")
     if config["ddr"]["efficiency"] > 1:
         raise ValueError("ddr.efficiency 必须在 (0, 1] 内")
     if min(config["plot"]["width_px"], config["plot"]["height_px"]) < 800:
         raise ValueError("图片宽高须至少 800 px，以显示完整泳道")
     return config
+
+
+def numeric_layout(config):
+    sizes = dict(config["dtype_bytes"])
+    numeric = config.get("numeric")
+    if numeric is None:
+        return sizes, None
+    operand, result, vector = (numeric[key] for key in
+                               ("tensor_input_dtype", "tensor_output_dtype", "vector_dtype"))
+    formats = dict.fromkeys(("q", "k", "v", "p"), operand)
+    formats.update(s=result, y=result, state=vector)
+    for obj in ("k", "v"):
+        fmt = numeric[f"ddr_{obj}_dtype"]
+        formats[f"ddr_{obj}"] = operand if fmt == "tensor" else fmt
+    sizes.update({obj: FORMAT_BYTES[fmt] for obj, fmt in formats.items()})
+    return sizes, formats
 
 
 @dataclass
@@ -67,10 +142,18 @@ class Operation:
     read_end: int = 0
     write_start: int = 0
     start: int = 0
+    conversion: dict | None = None
+    result_offset: int | None = None
+    local_deps: tuple = ()
 
     @property
     def ready(self):
         return self.start + self.ready_offset
+
+    def dependency_ready(self, predecessor):
+        if predecessor.name in self.local_deps and predecessor.result_offset is not None:
+            return predecessor.start + predecessor.result_offset
+        return predecessor.ready
 
     def runs(self, resource):
         """本操作在指定资源上的非零区间，含起止周期及每周期需求。"""
@@ -94,7 +177,10 @@ def byte_profile(size, rate):
 
 
 def make_model(config):
-    shape, sizes = config["shape"], config["dtype_bytes"]
+    shape = config["shape"]
+    sizes, formats = numeric_layout(config)
+    conversion = config.get("numeric", NUMERIC_DEFAULTS)["conversion"]
+    inline = formats is not None and conversion["mode"] == "inline"
     m, n = shape["query_rows"], shape["kv_cols"]
     dk, dv = shape["head_dim_qk"], shape["head_dim_v"]
     f = config["clock_ghz"]
@@ -123,10 +209,36 @@ def make_model(config):
         op.read_end = len(data)
         operations.append(op)
 
-    def compute(name, unit, work, deps=(), read_element_bytes=0, write_element_bytes=0):
+    def cast(source, destination, path, extra_cycles=0):
+        return {"source": source, "destination": destination,
+                "path": path, "extra_cycles": extra_cycles}
+
+    def dma_load(obj, elements):
+        name = f"{obj.upper()}_DMA"
+        if formats is None or formats[f"ddr_{obj}"] == formats[obj]:
+            transfer(name, "DMA_RD", elements * sizes[obj], "write")
+            operations[-1].bytes_read = elements * sizes[obj]
+            return
+        if not inline:
+            raise ValueError("DDR K/V 与 Tensor 格式不同时需要 inline DMA 转换")
+        source_width, destination_width = sizes[f"ddr_{obj}"], sizes[obj]
+        rate = min(capacities["DMA_RD"], capacities["L1_W"] * source_width / destination_width)
+        source = byte_profile(elements * source_width, rate)
+        extra = conversion["dma_extra_cycles"]
+        destination = np.pad(source * (destination_width / source_width), (extra, 0))
+        operations.append(Operation(
+            name, "DMA_RD", {"DMA_RD": source, "L1_W": destination}, len(destination),
+            formula=f"{elements} elements; {source_width} -> {destination_width} B; {len(source)}+{extra} c",
+            bytes_read=elements * source_width, bytes_written=elements * destination_width,
+            write_start=extra,
+            conversion=cast(formats[f"ddr_{obj}"], formats[obj], "DMA_RD", extra)))
+
+    def compute(name, unit, work, deps=(), read_element_bytes=0,
+                write_element_bytes=0, format_cast=None, local_deps=()):
         if work == 0:
             operations.append(Operation(name, unit, {}, 0, deps,
-                                        "single-element reduction: no binary operation"))
+                                        "single-element reduction: no binary operation",
+                                        local_deps=local_deps))
             return
         spec = vector["units"][unit]
         width = spec["parallelism"]
@@ -134,13 +246,17 @@ def make_model(config):
         groups = math.ceil(work / width)
         read_rate = min(capacities["VECTOR_LD"], capacities["L1_R"])
         write_rate = min(capacities["VECTOR_ST"], capacities["L1_W"])
-        read_cycles = math.ceil(width * read_element_bytes / read_rate)
-        write_cycles = math.ceil(width * write_element_bytes / write_rate)
+        read_cycles = math.ceil(min(width, work) * read_element_bytes / read_rate)
+        write_cycles = math.ceil(min(width, work) * write_element_bytes / write_rate)
         stride = max(1, read_cycles, write_cycles)
         input_delay = max(read_cycles, vector["input_latency_cycles"]) if read_element_bytes else 0
         output_extra = vector["output_latency_cycles"] - 1
+        if format_cast and format_cast["path"] == "VECTOR_LD":
+            input_delay += format_cast["extra_cycles"]
+        if format_cast and format_cast["path"] == "VECTOR_ST":
+            output_extra += format_cast["extra_cycles"]
         issues = [input_delay + group * stride for group in range(groups)]
-        end = issues[-1] + latency
+        result_end = end = issues[-1] + latency
         profile_size = end + output_extra + write_cycles + 1
         profiles = {unit: np.zeros(profile_size)}
         # 一条向量操作持有单元至末组发射；欠供期间在此单元产生空转占用。
@@ -174,7 +290,8 @@ def make_model(config):
             name, unit, profiles, end, deps,
             f"{work} ops / {width} lanes; {groups} groups; stride={stride} c; latency={latency} c",
             work, work * read_element_bytes, work * write_element_bytes,
-            issues, read_end, first_write))
+            issues, read_end, first_write, conversion=format_cast,
+            result_offset=result_end, local_deps=local_deps))
 
     def gemm(name, rows, cols, reduction, deps):
         blocks = math.ceil(rows / tensor["micro_m"]) * math.ceil(cols / tensor["micro_n"])
@@ -191,32 +308,56 @@ def make_model(config):
 
     q, k, v = m * dk * sizes["q"], n * dk * sizes["k"], n * dv * sizes["v"]
     s, p, y = m * n * sizes["s"], m * n * sizes["p"], m * dv * sizes["y"]
-    transfer("K_DMA", "DMA_RD", k, "write")
-    transfer("V_DMA", "DMA_RD", v, "write")
+    dma_load("k", n * dk)
+    dma_load("v", n * dv)
     transfer("Q_LD", "TENSOR_LD", q, "read")
     transfer("K_LD", "TENSOR_LD", k, "read", ("K_DMA",))
     gemm("QK", m, n, dk, ("Q_LD", "K_LD"))
     transfer("S_ST", "TENSOR_ST", s, "write", ("QK",))
-    compute("SCALE", "MUL", m * n, ("S_ST",), read_element_bytes=sizes["s"])
+    def vector_input(obj, elements, producer):
+        if formats is None or formats[obj] == formats["state"]:
+            return producer, sizes[obj], None
+        if inline:
+            return producer, sizes[obj], cast(
+                formats[obj], formats["state"], "VECTOR_LD", conversion["vector_load_extra_cycles"])
+        name = f"CVT_{obj.upper()}"
+        compute(name, "CVT", elements, (producer,), read_element_bytes=sizes[obj],
+                format_cast=cast(formats[obj], formats["state"], "CVT"))
+        return name, 0, None
+
+    s_input, s_read, s_cast = vector_input("s", m * n, "S_ST")
+    compute("SCALE", "MUL", m * n, (s_input,), read_element_bytes=s_read, format_cast=s_cast)
     compute("ROWMAX", "REDMAX", m * (n - 1), ("SCALE",))
     compute("MAX", "MAX", m, ("ROWMAX",))
     compute("SUB_S", "SUB", m * n, ("MAX",))
     compute("DELTA", "SUB", m, ("MAX",))
-    compute("EXP_P", "EXP", m * n, ("SUB_S",))
+    p_store = "EXP_P" if inline or (formats and formats["p"] == formats["state"]) else "CVT_P"
+    p_cast = None
+    if formats and formats["state"] != formats["p"]:
+        p_path = "VECTOR_ST" if inline else "CVT"
+        p_cast = cast(formats["state"], formats["p"], p_path,
+                      conversion["vector_store_extra_cycles"] if inline else 0)
+    compute("EXP_P", "EXP", m * n, ("SUB_S",),
+            write_element_bytes=sizes["p"] if p_store == "EXP_P" else 0,
+            format_cast=p_cast if p_store == "EXP_P" else None)
     compute("ALPHA", "EXP", m, ("DELTA",))
-    compute("ROWSUM", "REDSUM", m * (n - 1), ("EXP_P",))
-    compute("CVT_P", "CVT", m * n, ("EXP_P",), write_element_bytes=sizes["p"])
-    transfer("P_LD", "TENSOR_LD", p, "read", ("CVT_P",))
+    compute("ROWSUM", "REDSUM", m * (n - 1), ("EXP_P",), local_deps=("EXP_P",))
+    if p_store == "CVT_P":
+        compute(p_store, "CVT", m * n, ("EXP_P",), write_element_bytes=sizes["p"], format_cast=p_cast)
+    transfer("P_LD", "TENSOR_LD", p, "read", (p_store,))
     transfer("V_LD", "TENSOR_LD", v, "read", ("V_DMA",))
     gemm("PV", m, dv, n, ("P_LD", "V_LD"))
     transfer("Y_ST", "TENSOR_ST", y, "write", ("PV",))
     compute("SCALE_A", "MUL", m * dv, ("ALPHA", "Y_ST"))
-    compute("ADD_A", "ADD", m * dv, ("SCALE_A", "Y_ST"), read_element_bytes=sizes["y"])
+    y_input, y_read, y_cast = vector_input("y", m * dv, "Y_ST")
+    compute("ADD_A", "ADD", m * dv, ("SCALE_A", y_input),
+            read_element_bytes=y_read, format_cast=y_cast)
     compute("SCALE_L", "MUL", m, ("ALPHA", "ROWSUM"))
     compute("ADD_L", "ADD", m, ("SCALE_L", "ROWSUM"))
     lifetimes = [(k, "K_DMA", "K_LD"), (v, "V_DMA", "V_LD"),
-                 (s, "S_ST", "SCALE"), (p, "CVT_P", "P_LD"),
-                 (y, "Y_ST", "ADD_A")]
+                 (s, "S_ST", s_input if s_input != "S_ST" else "SCALE"),
+                 (p, p_store, "P_LD"),
+                 (y, "Y_ST", y_input if y_input != "Y_ST" else "ADD_A")]
     return operations, capacities, lifetimes, q
 
 
@@ -278,7 +419,7 @@ def solve(config):
         failed = False
         for op in operations:
             patterns = {r: folded_profile(p, ii) for r, p in op.profiles.items() if np.any(p)}
-            earliest = max((by_name[name].ready for name in op.deps), default=0)
+            earliest = max((op.dependency_ready(by_name[name]) for name in op.deps), default=0)
             valid = feasible_phases(patterns, occupied, capacities, ii)
             offsets = np.flatnonzero(valid[(earliest + np.arange(ii)) % ii])
             if not len(offsets):
@@ -309,7 +450,7 @@ def verify_schedule(operations, capacities, ii):
     by_name = {op.name: op for op in operations}
     for op in operations:
         for dep in op.deps:
-            if by_name[dep].ready > op.start:
+            if op.dependency_ready(by_name[dep]) > op.start:
                 raise AssertionError(f"依赖违规 {dep} → {op.name}")
     for a, b in (("MAX", "MAX"), ("ADD_L", "SCALE_L"), ("ADD_A", "SCALE_A")):
         if by_name[a].ready > by_name[b].start + ii:
@@ -370,13 +511,24 @@ def make_report(config, operations, capacities, ii, lower_bound, total, pools):
             "compute_only": timing(int(compute_union.sum())),
             "definition": "内部物理单元及接口占用区间的并集，包含图中隐藏的Vector访存",
         }
+    bandwidth = {}
+    for resource in ("L1_R", "L1_W"):
+        samples = np.tile(amounts[resource], periods)
+        edges = np.r_[0, np.flatnonzero(np.diff(samples)) + 1, len(samples)]
+        bandwidth[resource] = [
+            {"start": int(a), "end": int(b), "bytes_per_cycle": float(samples[a])}
+            for a, b in zip(edges, edges[1:])
+        ]
+    sizes, formats = numeric_layout(config)
     return {
         "config": config, "ii_cycles": ii, "resource_lower_bound_cycles": lower_bound,
+        "effective_formats": formats, "effective_dtype_bytes": sizes,
         "proven_optimal_in_model": ii == lower_bound,
         "scheduler": "确定性拓扑顺序、最早可行相位的周期排程；下界以上的结果为可行解",
         "window_cycles": ii * periods, "window_ns": ii * periods / frequency,
         "l1_reserved_bytes": total, "l1_pools": pools,
         "units": unit_times, "engines": engine_times,
+        "l1_bandwidth_intervals": bandwidth,
         "scope": "完整有效KV tile的中间稳态，Q已在L1；不含首块初始化、最终归一化与写回",
         "assumptions": [
             "Tensor局部操作数复用，Vector中间值、m/ℓ/A及其在途版本有足够本地空间",
@@ -387,7 +539,10 @@ def make_report(config, operations, capacities, ii, lower_bound, total, pools):
         ],
         "operations": [{
             "name": op.name, "unit": op.unit, "start": op.start, "ready": op.ready,
-            "dependencies": list(op.deps), "formula": op.formula, "work": op.work,
+            "result_ready": op.start + op.result_offset if op.result_offset is not None else op.ready,
+            "dependencies": list(op.deps), "local_dependencies": list(op.local_deps),
+            "formula": op.formula, "work": op.work, "conversion": op.conversion,
+            "attention_equation": ATTENTION_EQUATIONS.get(op.name),
             "bytes_read": op.bytes_read, "bytes_written": op.bytes_written,
             "issue_offsets": op.issue_offsets,
             "resource_intervals": {r: op.runs(r) for r in op.profiles},
@@ -432,13 +587,50 @@ def draw(config, operations, report, destination):
     show_io = plot["show_hidden_vector_io"] or throttled
     if show_io:
         lanes += ["VECTOR_LD", "VECTOR_ST"]
-    lanes += ["Tensor union", "Vector union", "DMA union"]
-    fig, ax = plt.subplots(figsize=(plot["width_px"] / plot["dpi"],
-                                    plot["height_px"] / plot["dpi"]), dpi=plot["dpi"])
-    fig.subplots_adjust(left=0.08, right=0.985, top=0.87, bottom=0.11)
+    lanes += ["Tensor union", "Vector union", "DMA union", "L1_R", "L1_W"]
+    figsize = (plot["width_px"] / plot["dpi"], plot["height_px"] / plot["dpi"])
+    fig, ax = plt.subplots(figsize=figsize, dpi=plot["dpi"])
+    fig.subplots_adjust(left=0.08, right=0.98, top=0.835, bottom=0.11)
+    ax.set_xlim(0, window)
+    ax.set_ylim(len(lanes)-0.5, -0.8)
+    renderer = fig.canvas.get_renderer()
+    # 同号表示在算法依赖图中可以并行，物理资源冲突由下方排程体现。
+    stages = [
+        (r"S_j=QK_j^{\mathsf{T}}/\sqrt{d_k}+\mathrm{mask}_j",),
+        (r"r_j=\mathrm{rowmax}(S_j)",),
+        (r"m_j=\max(m_{j-1},r_j)",),
+        (r"\alpha_j=\exp(m_{j-1}-m_j)", r"P_j=\exp(S_j-m_j)"),
+        (r"z_j=\mathrm{rowsum}(P_j)", r"Y_j=P_jV_j"),
+        (r"\ell_j=\alpha_j\ell_{j-1}+z_j", r"A_j=\alpha_j A_{j-1}+Y_j"),
+    ]
+    steps = "     ".join(
+        f"[{number}]  $" + equation + "$"
+        for number, stage in enumerate(stages, start=1) for equation in stage
+    )
+    caption = fig.text(0.08, 0.852, "单 tile 计算步骤（同号可并行）    " + steps,
+                       va="bottom", fontsize=15, color="#19324a")
+    available_width = ax.bbox.width
+    caption_width = caption.get_window_extent(renderer).width
+    if caption_width > available_width:
+        caption.set_fontsize(caption.get_fontsize() * available_width / caption_width)
+    outside_boxes = []
     colors = plt.get_cmap("Pastel1").colors
     for row, resource in enumerate(lanes):
         ax.axhspan(row - 0.45, row + 0.45, color="#f4f7fa", zorder=0)
+        if resource in ("L1_R", "L1_W"):
+            peak = report["units"][resource]["peak_demand_per_cycle"]
+            palette = plt.get_cmap("Blues" if resource == "L1_R" else "Greens")
+            for interval in report["l1_bandwidth_intervals"][resource]:
+                a, b, rate = interval["start"], interval["end"], interval["bytes_per_cycle"]
+                color = palette(0.13 + 0.42 * rate / max(1, peak)) if rate else "#ffffff"
+                ax.broken_barh([(a, b-a)], (row-0.23, 0.46), facecolors=color,
+                               edgecolors="#788b91", linewidth=0.5)
+                label = ax.text((a+b)/2, row, f"{rate:g}", va="center", ha="center",
+                                fontsize=8, color="#142934")
+                if label.get_window_extent(renderer).width + 5 > (b-a)*ax.bbox.width/window:
+                    label.set_y(row-0.25)
+                    label.set_va("bottom")
+            continue
         if resource.endswith(" union"):
             continue
         for op in operations:
@@ -459,13 +651,34 @@ def draw(config, operations, report, destination):
                         continue
                     ax.broken_barh([(a, b-a)], (row-0.3, 0.6),
                                    facecolors=colors[tile % len(colors)], edgecolors="#64758b", linewidth=0.5)
-                    if b - a > ii * 0.035:
-                        ax.text((a+b)/2, row, f"{op.name} [{tile}]\n{end-begin} c",
-                                ha="center", va="center", fontsize=8)
-                    elif begin + tile * ii >= 0 and end + tile * ii <= window:
-                        ax.annotate(f"{op.name} {end-begin}c", ((a+b)/2, row-0.3),
-                                    xytext=(2, 3), textcoords="offset points",
-                                    fontsize=6, color="#33465b")
+                    equation = ATTENTION_EQUATIONS.get(op.name) if resource == op.unit else None
+                    if equation:
+                        middle = (a + b) / 2
+                        math_label = "$" + equation + "$"
+                        label = ax.text(middle, row, math_label,
+                                        ha="center", va="center", fontsize=9)
+                        bounds = label.get_window_extent(renderer)
+                        width = (b-a) * ax.bbox.width / window
+                        height = 0.6 * ax.bbox.height / (len(lanes) + 0.3)
+                        if bounds.width + 6 > width or bounds.height + 3 > height:
+                            label.set_fontsize(7)
+                            half = (label.get_window_extent(renderer).width / 2 + 3) * window / ax.bbox.width
+                            x = min(max(middle, half), window - half)
+                            for y, align in ((row-0.32, "bottom"), (row+0.32, "top")):
+                                label.set_position((x, y))
+                                label.set_va(align)
+                                bounds = label.get_window_extent(renderer)
+                                if not any(bounds.overlaps(previous) for previous in outside_boxes):
+                                    break
+                            outside_boxes.append(bounds)
+                    elif b - a > ii * 0.035:
+                        # 搬运泳道的方向由行名给出，块内仅标数据对象。
+                        obj = op.name.split("_")[0]
+                        if resource == "VECTOR_LD":
+                            obj = "Y" if op.name in ("ADD_A", "CVT_Y") else "S"
+                        elif resource == "VECTOR_ST":
+                            obj = "P"
+                        ax.text((a+b)/2, row, obj, ha="center", va="center", fontsize=8)
             if resource == op.unit and op.issue_offsets:
                 for tile in range(-math.ceil(op.ready / ii), plot["periods"] + 1):
                     issue_end = op.start + op.issue_offsets[-1] + 1 + tile*ii
@@ -473,6 +686,13 @@ def draw(config, operations, report, destination):
                     if 0 <= issue_end < result <= window:
                         ax.plot([issue_end, result], [row+0.34, row+0.34], "--",
                                 color="#64758b", linewidth=0.8)
+            if resource == op.unit and op.conversion and op.conversion["extra_cycles"]:
+                path = op.conversion["path"]
+                end = op.start + op.issue_offsets[0] if path == "VECTOR_LD" else op.ready
+                begin = end - op.conversion["extra_cycles"]
+                for tile in range(math.floor(-end / ii) + 1, math.ceil((window - begin) / ii)):
+                    a, b = max(0, begin + tile * ii), min(window, end + tile * ii)
+                    ax.plot([a, b], [row-0.35, row-0.35], color="#9b4c80", linewidth=2)
             if not show_io and resource == op.unit and op.unit in VECTOR_UNITS:
                 marker = op.start + (op.issue_offsets[0] if op.issue_offsets else 0)
                 if op.bytes_read:
@@ -500,7 +720,8 @@ def draw(config, operations, report, destination):
                        (row-0.3,0.6), facecolors="#8198b3")
     ax.set_xlim(0, window)
     ax.set_ylim(len(lanes)-0.5, -0.8)
-    ax.set_yticks(range(len(lanes)), lanes, fontsize=10)
+    lane_labels = {"L1_R": "L1 读 (B/cycle)", "L1_W": "L1 写 (B/cycle)"}
+    ax.set_yticks(range(len(lanes)), [lane_labels.get(lane, lane) for lane in lanes], fontsize=10)
     ax.set_xticks(np.arange(plot["periods"]+1)*ii)
     ax.grid(axis="x", color="#cad4df", linewidth=0.7)
     ax.set_xlabel(f"Time (cycles); 1 cycle = {1/config['clock_ghz']:g} ns", fontsize=11)
@@ -510,9 +731,18 @@ def draw(config, operations, report, destination):
              f"L1 reserved {report['l1_reserved_bytes']/1024:g} KiB | one unit per type | "
              f"Vector I/O {'shown (requested or bandwidth-limited)' if show_io else 'overlapped; orange markers = first input / final output'}",
              fontsize=11)
+    if "numeric" in config:
+        numeric = config["numeric"]
+        fig.text(0.08, 0.894,
+                 f"Tensor {numeric['tensor_input_dtype'].upper()} -> {numeric['tensor_output_dtype'].upper()} | "
+                 f"Vector {numeric['vector_dtype'].upper()} | {numeric['conversion']['mode']} conversion"
+                 + (" | purple = conversion latency" if numeric["conversion"]["mode"] == "inline" else ""),
+                 fontsize=11)
     totals = " | ".join(f"{name} union {data['window_cycles']} c ({data['window_ns']:.1f} ns)"
                        for name,data in report["engines"].items())
-    fig.text(0.08,0.035,totals+"\nSteady-state window only; dashed segments show result latency. Engine unions include hidden I/O.",fontsize=10)
+    fig.text(0.08, 0.025, totals +
+             "\n完整有效 tile，$\\mathrm{mask}_j=0$。色块按 tile 着色，末两行数字为对应区间的 L1 总带宽（B/cycle）。"
+             "\n同号表示数据依赖允许并行。第 4 步的两支共用 EXP，实际发射时间以泳道为准。虚线表示结果延迟。", fontsize=10)
     # 明确指定像素尺寸，避免 bbox_inches='tight' 改变请求的全尺寸输出。
     fig.savefig(destination, dpi=plot["dpi"])
     plt.close(fig)

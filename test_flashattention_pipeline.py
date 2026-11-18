@@ -122,6 +122,62 @@ class PipelineTests(unittest.TestCase):
                             for shift in range(ii)]
                 np.testing.assert_array_equal(actual, expected)
 
+    def test_inline_conversion_preserves_local_result_and_delays_l1_visibility(self):
+        path = pipeline.DEFAULT_CONFIG.with_name("flashattention_pipeline.fp16_inline.json")
+        config = pipeline.validate_config(json.loads(path.read_text()))
+        ops, caps, ii, lower, _, _ = pipeline.solve(config)
+        by_name = {op.name: op for op in ops}
+        self.assertEqual((ii, lower), (520, 520))
+        self.assertNotIn("CVT_P", by_name)
+        self.assertEqual(by_name["SCALE"].issue_offsets[0], 3)
+        self.assertEqual(by_name["ADD_A"].issue_offsets[0], 3)
+        self.assertEqual(by_name["SCALE"].profiles["VECTOR_LD"].sum(), 8192)
+        exp = by_name["EXP_P"]
+        self.assertEqual(exp.profiles["VECTOR_ST"].sum(), 8192)
+        self.assertEqual(exp.write_start, 3)
+        self.assertEqual(exp.ready - exp.start - exp.result_offset, 3)
+        self.assertEqual(by_name["ROWSUM"].dependency_ready(exp), exp.start + exp.result_offset)
+        self.assertEqual(by_name["P_LD"].dependency_ready(exp), exp.ready)
+        pipeline.verify_schedule(ops, caps, ii)
+
+        config["numeric"]["conversion"]["vector_load_extra_cycles"] = 1
+        config["numeric"]["conversion"]["vector_store_extra_cycles"] = 1
+        changed, _, _, _ = pipeline.make_model(config)
+        changed_by_name = {op.name: op for op in changed}
+        self.assertEqual(changed_by_name["SCALE"].issue_offsets[0], 2)
+        self.assertEqual(changed_by_name["EXP_P"].write_start, 2)
+        self.assertEqual(changed_by_name["EXP_P"].issue_offsets, exp.issue_offsets)
+
+    def test_inline_dma_conversion_accounts_for_both_formats(self):
+        path = pipeline.DEFAULT_CONFIG.with_name("flashattention_pipeline.fp16_inline.json")
+        config = json.loads(path.read_text())
+        config["numeric"]["ddr_k_dtype"] = "fp32"
+        config["numeric"]["ddr_v_dtype"] = "bf16"
+        ops, caps, ii, _, _, _ = pipeline.solve(pipeline.validate_config(config))
+        by_name = {op.name: op for op in ops}
+        k = by_name["K_DMA"]
+        self.assertEqual(k.profiles["DMA_RD"].sum(), 32768)
+        self.assertEqual(k.profiles["L1_W"].sum(), 16384)
+        self.assertEqual(k.runs("L1_W")[0][0], k.start + 2)
+        self.assertEqual(k.ready, k.runs("DMA_RD")[-1][1] + 2)
+        v = by_name["V_DMA"]
+        self.assertEqual(v.bytes_read, v.bytes_written)
+        self.assertEqual(v.conversion["source"], "bf16")
+        self.assertEqual(v.ready, v.runs("DMA_RD")[-1][1] + 2)
+        pipeline.verify_schedule(ops, caps, ii)
+
+    def test_explicit_conversion_reserves_the_cvt_unit(self):
+        path = pipeline.DEFAULT_CONFIG.with_name("flashattention_pipeline.fp16_inline.json")
+        config = json.loads(path.read_text())
+        config["numeric"]["conversion"]["mode"] = "explicit"
+        ops, _, _, _, _, _ = pipeline.solve(pipeline.validate_config(config))
+        named = {op.name: op for op in ops}
+        self.assertEqual({op.name for op in ops if op.unit == "CVT"}, {"CVT_S", "CVT_P", "CVT_Y"})
+        self.assertEqual(named["SCALE"].deps, ("CVT_S",))
+        self.assertEqual(named["P_LD"].deps, ("CVT_P",))
+        self.assertEqual(named["CVT_P"].issue_offsets[-1] + 1, 64)
+        self.assertIn("CVT_Y", named["ADD_A"].deps)
+
 
 if __name__ == "__main__":
     unittest.main()

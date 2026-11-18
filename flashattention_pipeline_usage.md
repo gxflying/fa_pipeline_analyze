@@ -10,7 +10,7 @@
 
 | 文件 | 内容 |
 |---|---|
-| pipeline.png | 稳态泳道图及各引擎合并忙碌区间 |
+| pipeline.png | 泳道框上方单行列出计算步骤，同号表示数据依赖允许并行。计算块仅标公式，小块公式紧贴上沿或下沿。DMA union 下方两行显示每周期 L1 总读、写带宽（B/cycle），包含隐藏的 Vector 访存，连续等值区间合并 |
 | unit_statistics.png | 各计算单元的占用/发射时间，以及各读写接口的活动时间 |
 | engine_statistics.png | Tensor、Vector、DMA 含读写与纯计算两种口径的时间并集 |
 | report.json | 全部数值、配置、排程与图片路径 |
@@ -23,6 +23,7 @@
 |---|---|
 | shape | Q 行数、KV tile 列数、QK/V 头维，支持非整齐微块与尾组 |
 | clock_ghz、dtype_bytes | 时钟和各数据对象的元素字节数 |
+| numeric（选填） | Tensor 输入与输出格式、Vector 格式、DDR 中的 K/V 格式及转换方式 |
 | tensor | M/K/N 微块并行度、微步结果延迟、L1 读写分配上限 |
 | ddr | 读写额定 GB/s、有效系数 |
 | l1 | KiB 容量、读写 GB/s |
@@ -30,14 +31,29 @@
 | scheduler.max_ii_cycles | 周期排程搜索上限，找不到可行解时报告原因 |
 | plot | 展示的完整周期数、PNG 尺寸、DPI、是否强制显示隐藏的 Vector 读写 |
 
-所有字段必填，未知字段、非正数和无穷值会报错。各类型执行单元均为一套。parallelism 表示每周期接收的元素数，REDMAX/REDSUM 按二元操作数计。latency_cycles 表示一组从发射到结果可见的周期数，默认普通 Vector 操作为 1，Tensor 为 15。读首拍取 max(首组传输周期, input_latency_cycles)，写首组在计算结果可见后再等 output_latency_cycles−1，随后通过写口发送。
+除 numeric 外的配置字段均必填。未知字段、非正数和无穷值会报错。各类型执行单元均为一套。parallelism 表示每周期接收的元素数，REDMAX/REDSUM 按二元操作数计。latency_cycles 表示一组从发射到结果可见的周期数，默认普通 Vector 操作为 1，Tensor 为 15。读首拍取 max(首组传输周期, input_latency_cycles)，写首组在计算结果可见后再等 output_latency_cycles−1，随后通过写口发送。
+
+### 数值格式与转换
+
+支持 fp16、bf16、fp32。配置 numeric 后，Tensor 输入格式决定 L1 中的 Q/K/V/P 字节数，Tensor 输出格式决定 S/Y 字节数，Vector 格式决定本地状态的元素字节数。实际位宽写入报告的 effective_dtype_bytes。省略 numeric 时沿用 dtype_bytes 和原有 CVT_P 路径。
+
+- explicit 使用独立 Vector CVT，按该单元的并行度和延迟占用资源。S/Y 和 P 仅在两端格式不同时转换。DDR 的 K/V 须已采用 Tensor 输入格式。
+- inline 在 Vector load 扩展 S/Y，在 Vector store 转换 P。跨格式才加转换延迟，读写端各可取 1 或 2 cycle，流水可每拍接收数据，端口按 L1 存储格式计费。行求和可直接消费本地 P，Tensor 的 P 读取等到最后一组转换数据写入 L1。
+- ddr_k_dtype、ddr_v_dtype 取 tensor 时，DDR 和 L1 均使用 Tensor 的 K/V 格式。填写具体且不同的源格式时，inline DMA 分别按源、目的字节数占用 DDR 读和 L1 写，目的端流比源端晚 1 或 2 cycle。
+
+数值格式用于时序与流量估算。Tensor 微步形状、吞吐和延迟仍由硬件参数指定，本模型不模拟舍入误差或内部累加精度。仿真窗口内的 DMA 方向为 DDR 读到 L1。
+
+以 Tensor 输入和输出 FP16、Vector FP32、随路转换 2 cycle 运行
+
+    python3 flashattention_pipeline.py --config flashattention_pipeline.fp16_inline.json --output-dir artifacts/flashattention_fp16_inline
 
 ## 时间与统计
 
 - units 中每一项给出单周期及整个绘图窗口的占用周期、纳秒、利用率、发射周期和资源需求。欠供造成向量操作停顿时，操作仍持有单元，占用时间包含这一停顿，发射周期另列。
 - engines 中 Tensor、Vector、DMA 的主时间是该引擎内部所有单元和读写接口忙碌区间的**并集**。被图形隐藏的 Vector 读写也参与统计。
 - compute_only 另给纯计算区间并集。三类引擎可重叠执行，各自时间相加不等于窗口长度。
-- operations 保存每项操作的工作量、公式、起止时刻、依赖、发射组和各物理资源占用区间，可独立复算。
+- l1_bandwidth_intervals 保存整个绘图窗口的 L1 读写带宽。每段覆盖半开区间 [start, end)，bytes_per_cycle 为该区间每个周期实际传输的总字节数，空闲周期记零。
+- operations 保存每项操作的工作量、周期计算式、起止时刻、依赖、发射组和各物理资源占用区间。attention_equation 记录泳道图对应的在线 Softmax 公式，完整有效 tile 取 mask 为零。
 - RCP、DIV、SQRT 与 DMA_WR 在中间 KV 稳态中为零。初始化、最终归一化和输出写回发生于 Q 块边界，当前统计窗口专注于中间稳态。
 
 默认值的资源下界是 520 cycle/tile。脚本从资源下界开始，以固定拓扑顺序寻找最早可行的周期相位，再检查跨 tile 的 m/ℓ/A 反馈与 L1 槽位。如果结果达到下界，proven_optimal_in_model 为 true。超过下界时输出已验证的可行排程，固定顺序的搜索不保证全局最优。
