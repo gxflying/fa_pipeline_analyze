@@ -234,6 +234,8 @@ $$
 
 ## 7. Vector 流式访存与每类单元一份的当前模型
 
+本节描述执行资源与访存模型；实际执行时间的统计及总图口径见第 8 节。
+
 MUL、ADD、SUB、MAX、CVT、EXP、DIV、RCP、SQRT、REDMAX、REDSUM 各有一份物理资源，用独立的 $P_u,L_u$ 表示吞吐和结果延迟。同类型不同步骤在该资源上排队，不同类型可以并发。REDMAX 与 REDSUM 默认各为 64 个二元操作/cycle，EXP/DIV/RCP/SQRT 各为 8 元素/cycle，其余各为 64 元素/cycle。
 
 Vector load 在数据到达后逐组交付，store 在每组结果产生后逐组接收。读写端口的实际服务率为
@@ -270,4 +272,63 @@ II_{\rm Tensor}=2MND/2048=512.
 $$
 
 每 tile 的 MUL 工作量为 $MN+M+MD=12352$，占 193 cycle；ADD 为 $M+MD=8256$，占 129 cycle；SUB 为 $MN+M=4160$，占 65 cycle；CVT 占 64 cycle；REDMAX/REDSUM 各占 63 cycle。新增“单元复用·流式访存”页面展示可行的 520-cycle 周期排程。S load 与缩放重叠，Y load 与分子 ADD 重叠，P store 跟随 CVT。Tensor 的整块读写按其已有接口模型计费。
+
+## 8. DMA / Tensor / Vector 实际执行时间与并行总图
+
+### 8.1 累计工作量、忙碌并集、完成跨度
+
+令 $I_u$ 为单 tile 在物理资源 $u$ 上的全部实际占用区间的并集，$|I|$ 表示区间总长度。计算资源占用包含当前模型中因供数不足而持有单元的停顿；结果尾延迟不自动算作单元占用。
+
+$$
+W_E=\sum_{u\in E}|I_u|,\qquad
+B_E=\left|\bigcup_{u\in E}I_u\right|,\qquad
+\overline P_E=W_E/B_E.
+$$
+
+$W_E$ 单位为 resource-cycle，是工作量，不能当作墙钟执行时间；$B_E$ 单位为 cycle，是至少一个所属资源活动的时间；$\overline P_E$ 是忙碌期间平均活动资源数，空集合按零计。另定义完成跨度
+
+$$
+C_E=\max_{o\in E}t_{\mathrm{ready},o}-\min_{o\in E}t_{\mathrm{start},o}.
+$$
+
+$C_E$ 从该引擎首次操作启动到最后结果就绪，包含输入、尾延迟与依赖等待。报告另保留占用跨度，即最早占用到最后占用的距离，不能代替完成跨度。
+
+Tensor/Vector 的计算口径只包括算术资源；DMA 的主口径为读写接口。含 I/O 口径另对引擎全部计算与接口取并集。L1 是共享约束，不再作为引擎内部资源重复累计。三类引擎彼此仍可重叠，其忙碌时间之和不是端到端时间。
+
+### 8.2 算法分支与单份硬件约束
+
+在 $m_j$ 就绪后，一支计算 $\Delta m_j\to\alpha_j\to(\widetilde\ell_j,\widetilde A_j)$，另一支计算 $U_j=S_j-m_j\to P_j\to(z_j,Y_j)$。其中 $\widetilde\ell_j=\alpha_j\ell_{j-1}$、$\widetilde A_j=\alpha_jA_{j-1}$、$z_j=\mathrm{rowsum}(P_j)$、$Y_j=P_jV_j$。
+
+| 无跨支数据依赖的步骤 | 实际硬件关系 |
+|---|---|
+| $\Delta m_j$ 与 $U_j$ | 共用唯一 SUB，分时执行 |
+| $\alpha_j$ 与 $P_j$ | 共用唯一 EXP，分时执行 |
+| $\widetilde\ell_j$ 与 $\widetilde A_j$ | 共用唯一 MUL，分时执行 |
+| $z_j$ 与 $Y_j$ | REDSUM 与 Tensor 可重叠，仍受输入可见性和 L1 带宽约束 |
+| $\ell_j$ 与 $A_j$ 的最终加法 | 共用唯一 ADD，分时执行 |
+
+不同类型单元可以交错，例如一支执行 EXP 时另一支执行 SUB。必须先将依赖映射到资源并得到实际调度，不能直接对两条完整算法分支的独立耗时取 max。
+
+对消费者 $v$，令 $q_{uv}$ 表示前驱 $u$ 的结果对该消费者真正可消费的时刻，则
+
+$$
+g_v=\max_{u\in\mathrm{pred}(v)}q_{uv},\qquad
+s_v\ge g_v.
+$$
+
+实际 $s_v$ 还须满足单元、接口、共享带宽和周期相位约束。报告中的 $s_v-g_v$ 是排程等待，不能只凭该差值断言全部来自某一个资源。
+
+分母更新需要历史分母缩放和行归约就绪；分子更新需要历史分子缩放和 Tensor 结果就绪。脚本按实际直接前驱计算汇合，包含 Y_ST 或显式转换等步骤。随路转换时，本地 REDSUM 可以读取 FP32 P，而 PV 需要等窄格式 P 在 L1 可用，两者可消费时刻不同。
+
+只有同起点、独立资源且无额外带宽冲突的分支，其并行历时才为 $\max(T_1,T_2,\ldots)$。起点不同时，汇合历时为 $\max_i(s_i+T_i)-t_{\mathrm{fork}}$。这些 max 是依赖汇合关系；整个 Vector 忙碌时间仍由实际区间并集计算。
+
+### 8.3 总图与稳态统计
+
+脚本新增 execution_overview.png，使用与原泳道相同的调度结果：
+
+1. 上部展示稳态排程中的单 tile 轨迹，保留真实空闲与等待。DMA/Tensor/Vector 主行使用含 I/O 并集，Vector 下方按物理计算资源展开，每类只有一行，公式标注在操作上方。主行色深按各行峰值归一化，表达该行同时活动资源数；跨行绝对并行度以右侧数值为准。
+2. 右侧列出单 tile 的计算工作量、计算忙碌并集、引擎完成跨度和计算并行度，并给出 ADD_L / ADD_A 的实际输入就绪 max 与启动时刻。
+3. 下部展示多个完整 II 的稳态引擎活动与 L1 带宽。计算跨窗口的前后 tile，避免漏掉跨周期占用；时间竖线标记 II。跨 tile 并行和单 tile 算法并行分别呈现。
+
+单 tile 轨迹不是孤立运行时的最短延迟；当前排程器给出可行周期调度，下界匹配只能证明模型内 II 最优，不能证明所有单 tile 完成跨度最短。初始化、最终归一化和输出写回仍不在中间稳态统计范围。
 

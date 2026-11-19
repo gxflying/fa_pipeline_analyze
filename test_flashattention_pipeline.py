@@ -7,6 +7,31 @@ import flashattention_pipeline as pipeline
 
 
 class PipelineTests(unittest.TestCase):
+    def test_overview_uses_resource_union_and_real_join_readiness(self):
+        config = json.loads(pipeline.DEFAULT_CONFIG.read_text())
+        ops, _, ii, _, _, _ = pipeline.solve(config)
+        data, _, _ = pipeline.execution_overview(ops, ii, 4*ii)
+        for engine, resources in pipeline.ENGINE_RESOURCES.items():
+            selected = [r for r in resources if r == "TENSOR" or r in pipeline.VECTOR_UNITS]
+            if engine == "DMA":
+                selected = resources
+            per_resource = {r: set() for r in selected}
+            for op in ops:
+                for r in selected:
+                    for a, b, _ in op.runs(r):
+                        per_resource[r].update(range(a,b))
+            expected = set().union(*per_resource.values())
+            actual = data["single_tile"][engine]["primary"]
+            self.assertEqual(actual["busy_cycles"], len(expected))
+            self.assertEqual(actual["work_resource_cycles"], sum(map(len,per_resource.values())))
+            phases = {t % ii for t in expected}
+            self.assertEqual(data["steady_window"][engine]["primary"]["busy_cycles"],4*len(phases))
+        vector = data["single_tile"]["Vector"]["primary"]
+        self.assertGreater(vector["work_resource_cycles"],vector["busy_cycles"])
+        for join in data["joins"]:
+            self.assertEqual(join["dependency_gate"],max(join["input_ready"].values()))
+            self.assertGreaterEqual(join["scheduled_wait_cycles"],0)
+
     def setUp(self):
         self.config = json.loads(pipeline.DEFAULT_CONFIG.read_text())
 

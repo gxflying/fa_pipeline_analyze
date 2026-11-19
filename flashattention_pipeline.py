@@ -550,6 +550,165 @@ def make_report(config, operations, capacities, ii, lower_bound, total, pools):
     }
 
 
+def execution_overview(operations, ii, window):
+    """从实际资源区间重建单 tile 和周期窗口，不以操作时长之和代替并集。"""
+    end = max(op.ready for op in operations)
+    resources = {r for rs in ENGINE_RESOURCES.values() for r in rs}
+    single = {r: np.zeros(end, dtype=bool) for r in resources}
+    steady = {r: np.zeros(window, dtype=bool) for r in resources}
+    for op in operations:
+        for r in resources:
+            for a, b, _ in op.runs(r):
+                single[r][a:b] = True
+                for tile in range(math.floor(-b / ii) + 1, math.ceil((window-a) / ii)):
+                    left, right = max(0, a+tile*ii), min(window, b+tile*ii)
+                    steady[r][left:right] = True
+
+    def summarize(masks, selected):
+        count = np.sum([masks[r].astype(int) for r in selected], axis=0)
+        active = np.flatnonzero(count)
+        busy = len(active)
+        return dict(work_resource_cycles=int(count.sum()), busy_cycles=busy,
+                    occupancy_span_cycles=int(active[-1]-active[0]+1) if busy else 0,
+                    average_parallelism=float(count.sum()/busy) if busy else 0,
+                    peak_parallelism=int(count.max()))
+
+    data = {"single_tile": {}, "steady_window": {}, "joins": []}
+    for engine, rs in ENGINE_RESOURCES.items():
+        primary = tuple(r for r in rs if r == "TENSOR" or r in VECTOR_UNITS)
+        if engine == "DMA":
+            primary = rs
+        owned = [op for op in operations if op.unit in rs]
+        for name, masks in (("single_tile", single), ("steady_window", steady)):
+            data[name][engine] = {"primary": summarize(masks, primary),
+                                  "including_io": summarize(masks, rs)}
+        data["single_tile"][engine]["completion_span_cycles"] = (
+            max(op.ready for op in owned)-min(op.start for op in owned) if owned else 0)
+    by_name = {op.name: op for op in operations}
+    for name in ("ADD_L", "ADD_A"):
+        op = by_name[name]
+        ready = {dep: op.dependency_ready(by_name[dep]) for dep in op.deps}
+        gate = max(ready.values())
+        data["joins"].append(dict(operation=name, input_ready=ready,
+                                  dependency_gate=gate, scheduled_start=op.start,
+                                  scheduled_wait_cycles=op.start-gate))
+    return data, single, steady
+
+
+def draw_execution_overview(config, operations, report, destination):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    configure_plot_fonts()
+    data, single, steady = execution_overview(
+        operations, report["ii_cycles"], report["window_cycles"])
+    report["execution_overview"] = data
+    plot = config["plot"]
+    fig = plt.figure(figsize=(plot["width_px"]/plot["dpi"],
+                              plot["height_px"]/plot["dpi"]), dpi=plot["dpi"])
+    grid = fig.add_gridspec(2, 2, width_ratios=[3.6, 1.4], height_ratios=[2.2, 1],
+                           left=.055, right=.985, top=.89, bottom=.09,
+                           hspace=.42, wspace=.08)
+    top, bottom = fig.add_subplot(grid[0, 0]), fig.add_subplot(grid[1, 0])
+    notes = fig.add_subplot(grid[:, 1]); notes.axis("off")
+    active_units = [r for r in VECTOR_UNITS if single[r].any()]
+    lanes = ["DMA", "Tensor", "Vector"] + active_units
+    colors = plt.get_cmap("Blues")
+
+    def blocks(ax, values, row, cmap=colors):
+        edges = np.r_[0, np.flatnonzero(np.diff(values))+1, len(values)]
+        for a, b in zip(edges, edges[1:]):
+            if values[a]:
+                ax.broken_barh([(int(a), int(b-a))], (row-.29, .58),
+                               facecolors=cmap(.28+.65*values[a]/max(1, values.max())),
+                               edgecolors="white", linewidth=.25)
+
+    for row, lane in enumerate(lanes):
+        top.axhspan(row-.43, row+.43, color="#f2f5f8", zorder=0)
+        if lane in ENGINE_RESOURCES:
+            rs = ENGINE_RESOURCES[lane]
+            # 主泳道统一包含接口；内部资源行仅显示计算。
+            count = np.sum([single[r].astype(int) for r in rs], axis=0)
+            blocks(top, count, row)
+        else:
+            last_label_end = -float("inf")
+            for op in operations:
+                if op.unit != lane:
+                    continue
+                intervals = op.runs(lane)
+                for a, b, _ in intervals:
+                    top.broken_barh([(a, b-a)], (row-.26, .52), facecolors="#9bc9e2")
+                if intervals:
+                    a, b = intervals[0][0], intervals[-1][1]
+                    equation = ATTENTION_EQUATIONS.get(op.name, op.name)
+                    # 相邻短操作分别放在上下侧，避免两个 SUB 的公式相互覆盖。
+                    middle = (a+b)/2
+                    below = middle-last_label_end < max(op.ready for op in operations)*.065
+                    top.text(middle, row+.29 if below else row-.29, "$"+equation+"$",
+                             fontsize=9, ha="center", va="top" if below else "bottom")
+                    last_label_end = middle
+    for join in data["joins"]:
+        row = lanes.index("ADD")
+        top.plot(join["scheduled_start"], row, "v", color="#b76426", markersize=6)
+    top.set_yticks(range(len(lanes)), lanes, fontsize=11)
+    top.set_ylim(len(lanes)-.5, -.9)
+    top.set_xlim(0, max(op.ready for op in operations))
+    top.set_title("单 tile：保留真实等待与交错；主泳道为含 I/O 的并集，颜色越深同时活动资源越多",
+                  loc="left", fontsize=15, pad=15)
+    top.set_xlabel("实际排程时间 / cycle（计算块上方为公式；橙色标记为 ADD 汇合）", fontsize=11)
+    for row, engine in enumerate(("DMA", "Tensor", "Vector")):
+        count = np.sum([steady[r].astype(int) for r in ENGINE_RESOURCES[engine]], axis=0)
+        blocks(bottom, count, row)
+        # 精确并行数轮廓，区别连续满忙与内部并行。
+        bottom.plot(np.arange(len(count)), row+.32-.1*count/max(1, count.max()),
+                    color="#143d59", linewidth=.7)
+    for row, r in enumerate(("L1_R", "L1_W"), start=3):
+        for interval in report["l1_bandwidth_intervals"][r]:
+            a, b, rate = interval["start"], interval["end"], interval["bytes_per_cycle"]
+            bottom.broken_barh([(a,b-a)], (row-.29,.58),
+                              facecolors=plt.get_cmap("Greens")(.12+.7*rate/max(
+                                  1, report["units"][r]["peak_demand_per_cycle"])))
+        bottom.text(report["window_cycles"]*.99, row,
+                    f"峰值 {report['units'][r]['peak_demand_per_cycle']:g} B/cycle",
+                    ha="right", va="center", fontsize=10)
+    bottom.set_yticks(range(5), ["DMA", "Tensor", "Vector", "L1 读", "L1 写"], fontsize=11)
+    bottom.set_ylim(4.5,-.7); bottom.set_xlim(0,report["window_cycles"])
+    bottom.set_xticks(np.arange(config["plot"]["periods"]+1)*report["ii_cycles"])
+    bottom.set_title("满流水：包含跨 tile 重叠；竖线间隔为 II", loc="left", fontsize=15)
+    bottom.set_xlabel("稳态时间 / cycle", fontsize=11)
+    for ax in (top,bottom):
+        ax.grid(axis="x", alpha=.25); ax.set_axisbelow(True)
+    lines = ["时间统计（单位 cycle；W 为 resource-cycle）",
+             "W = 各资源占用累计；B = 占用区间并集",
+             "C = 首次启动至最终结果就绪，包含等待", "",
+             "单 tile：计算口径（DMA 按读写接口）"]
+    for engine in ("DMA", "Tensor", "Vector"):
+        item = data["single_tile"][engine]; p = item["primary"]
+        lines += [f"{engine}: W={p['work_resource_cycles']}   B={p['busy_cycles']}   C={item['completion_span_cycles']}",
+                  f"    忙碌期间平均并行度 {p['average_parallelism']:.2f}；峰值 {p['peak_parallelism']}"]
+    lines += ["", "稳态窗口：计算 W / B；含 I/O 并集"]
+    for engine in ("DMA", "Tensor", "Vector"):
+        item = data["steady_window"][engine]; p = item["primary"]
+        lines += [f"{engine}: {p['work_resource_cycles']} / {p['busy_cycles']}；{item['including_io']['busy_cycles']}"]
+        lines += [f"    计算平均并行度 {p['average_parallelism']:.2f}；峰值 {p['peak_parallelism']}"]
+    lines += ["", "实际汇合（按输入可消费时刻取 max）"]
+    for join in data["joins"]:
+        values = ", ".join(str(v) for v in join["input_ready"].values())
+        lines += [f"{join['operation']}: max({values}) = {join['dependency_gate']}",
+                  f"    实际启动 {join['scheduled_start']}；排程等待 {join['scheduled_wait_cycles']}"]
+    lines += ["", "同类 SUB / EXP / MUL / ADD 各一份，必须分时。",
+              "REDSUM 与 Tensor 可重叠，仍需满足数据和带宽约束。",
+              "排程等待不单独归因于某资源；还包含周期相位约束。",
+              "分支同起点且资源无冲突时，历时才等于 max(T1,T2)。"]
+    notes.text(0,1,"\n".join(lines), va="top", fontsize=12, linespacing=1.5)
+    fig.suptitle(f"FlashAttention · DMA / Tensor / Vector 实际执行时间 | II={report['ii_cycles']} cycle/tile",
+                 fontsize=23, y=.97)
+    fig.text(.055,.025,"单 tile 为稳态排程中一个 tile 的轨迹，并非孤立执行的最短延迟。计算占用包含供数停顿；初始化和最终归一化不在当前范围。",
+             fontsize=12)
+    fig.savefig(destination, dpi=plot["dpi"]); plt.close(fig)
+
+
 def configure_plot_fonts():
     import matplotlib as mpl
     from matplotlib import font_manager
@@ -857,6 +1016,9 @@ def main():
     png = args.output_dir / "pipeline.png"
     draw(config, operations, report, png)
     statistics_paths = draw_statistics(config, report, args.output_dir)
+    overview_path = args.output_dir / "execution_overview.png"
+    draw_execution_overview(config, operations, report, overview_path)
+    statistics_paths["execution_overview"] = overview_path
     report["png"] = {"path": str(png.resolve()), "width_px": config["plot"]["width_px"],
                      "height_px": config["plot"]["height_px"]}
     report["statistics_png"] = {
