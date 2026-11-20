@@ -67,12 +67,15 @@ def parameter_caption(config):
     for group in ('vector', 'tensor', 'l1', 'ddr'):
         spec = config[group]
         efficiency = spec.get('efficiency', 1)
-        rates = ' / '.join(f"{spec[d+'_gbps']:g} GB/s → {spec[d+'_gbps']*efficiency/f:g} B/cycle" for d in ('read', 'write'))
+        rates = ' / '.join(
+            (f"{spec[d+'_port_gbps']:g} GB/s/port × {spec[d+'_ports']} ports → {spec[d+'_port_gbps']*spec[d+'_ports']/f:g} B/cycle" if group == 'vector' else
+             f"{spec[d+'_gbps']:g} GB/s → {spec[d+'_gbps']*efficiency/f:g} B/cycle") for d in ('read', 'write'))
         lines.append(f"{group.upper()} 读 / 写容量: {rates}" + (f"；DDR efficiency={efficiency:g}（箭头后为有效值）" if group == 'ddr' else ''))
     lines.append(f"有效数据字节数 {sizes}；格式 {formats or '由 dtype_bytes 指定'}；mask {config['mask']}")
     lines.append(f"Tensor micro(M,K,N)=({config['tensor']['micro_m']},{config['tensor']['micro_k']},{config['tensor']['micro_n']})；计算延迟 {config['tensor']['latency_cycles']} c；" + '；'.join(f"{g} 输入/输出延迟 {config[g]['input_latency_cycles']}/{config[g]['output_latency_cycles']} c" for g in ('tensor', 'vector')))
     lines.append('Vector 各类型一份；并行度/延迟(c): ' + ' | '.join(f"{k} {v['parallelism']}/{v['latency_cycles']}" for k,v in config['vector']['units'].items()))
     lines.append(f"转换 {config.get('numeric', {}).get('conversion', '未启用 numeric')}；排程最大 II {config['scheduler']['max_ii_cycles']}；非活跃参数不会强制改变时序。")
+    lines.append('L1 实际占用 = Vector 整端口拍 + Tensor/DMA 原流式需求；每条 Vector 操作每周期最多一个端口，端口逐拍释放，不模拟 AXI burst 锁定。')
     return lines
 
 
@@ -85,9 +88,9 @@ def save_parameterized_figure(fig, destination, config):
     plot_buffer = io.BytesIO()
     fig.savefig(plot_buffer, dpi=dpi)
     lines = parameter_caption(config)
-    footer = plt.figure(figsize=(fig.get_figwidth(), 2.15), dpi=dpi)
+    footer = plt.figure(figsize=(fig.get_figwidth(), 2.4), dpi=dpi)
     for i, line in enumerate(lines):
-        footer.text(.02, .94-i*.105, line, va='top', fontsize=9)
+        footer.text(.02, .96-i*.095, line, va='top', fontsize=9)
     footer_buffer = io.BytesIO()
     footer.savefig(footer_buffer, dpi=dpi)
     plt.close(footer)
@@ -146,6 +149,9 @@ def validate_config(config):
             raise ValueError("DDR K/V 与 Tensor 格式不同时需要 inline DMA 转换")
     if config["ddr"]["efficiency"] > 1:
         raise ValueError("ddr.efficiency 必须在 (0, 1] 内")
+    for direction in ('read', 'write'):
+        if config['vector'][direction+'_port_gbps'] > config['l1'][direction+'_gbps']:
+            raise ValueError('L1 带宽必须至少覆盖一个 Vector 端口；不支持跨周期拆分总线拍')
     if config["mask"] != {"source": "ddr", "dtype": "vector"}:
         raise ValueError("当前mask模型仅支持source=ddr、dtype=vector（稠密加性mask）")
     if min(config["plot"]["width_px"], config["plot"]["height_px"]) < 800:
@@ -237,7 +243,11 @@ def make_model(config):
                 name = f"{prefix}_{'LD' if suffix == 'R' else 'ST'}"
             elif prefix == "DMA":
                 name = f"DMA_{'RD' if suffix == 'R' else 'WR'}"
-            capacities[name] = config[group][f"{direction}_gbps"] * efficiency / f
+            rate = (config[group][direction+'_port_gbps'] * config[group][direction+'_ports']
+                    if group == 'vector' else config[group][direction+'_gbps'])
+            capacities[name] = rate * efficiency / f
+    capacities['L1_R_BUS'] = capacities['L1_R']
+    capacities['L1_W_BUS'] = capacities['L1_W']
     operations = []
 
     def transfer(name, unit, size, direction, deps=()):
@@ -286,8 +296,9 @@ def make_model(config):
         width = spec["parallelism"]
         latency = spec["latency_cycles"]
         groups = math.ceil(work / width)
-        read_rate = min(capacities["VECTOR_LD"], capacities["L1_R"])
-        write_rate = min(capacities["VECTOR_ST"], capacities["L1_W"])
+        # 一个操作每周期使用至多一个端口；多端口允许不同操作并发。
+        read_rate = vector['read_port_gbps'] / f
+        write_rate = vector['write_port_gbps'] / f
         read_cycles = math.ceil(min(width, work) * read_element_bytes / read_rate)
         write_cycles = math.ceil(min(width, work) * write_element_bytes / write_rate)
         stride = max(1, read_cycles, write_cycles)
@@ -431,6 +442,17 @@ def make_model(config):
                  (s, "QK", s_input if s_input != "QK" else "SCALE"),
                  (p, p_store, "PV"),
                  (y, "PV", y_input if y_input != "PV" else "ADD_A")]
+    for op in operations:
+        for effective, bus, port, direction in (
+                ('L1_R', 'L1_R_BUS', 'VECTOR_LD', 'read'),
+                ('L1_W', 'L1_W_BUS', 'VECTOR_ST', 'write')):
+            if effective in op.profiles:
+                op.profiles[bus] = op.profiles[effective].copy()
+            if port in op.profiles:
+                beat = vector[direction+'_port_gbps'] / f
+                # 有效数据保留在 L1_R/W；接口与总线按完整端口拍占用。
+                op.profiles[port] = (op.profiles[port] > 0).astype(float) * beat
+                op.profiles[bus] = op.profiles[port].copy()
     return operations, capacities, lifetimes, q + m*dv*sizes["state"]
 
 
@@ -612,9 +634,9 @@ def bandwidth_regions(values):
 def draw_bandwidth_lane(ax, report, resource, row):
     values = bandwidth_samples(report, resource)
     cfg = report["config"]
-    direction = "read" if resource == "L1_R" else "write"
+    direction = "read" if resource.startswith("L1_R") else "write"
     cap = cfg["l1"][direction+"_gbps"]/cfg["clock_ghz"]
-    color = "#246a9e" if resource == "L1_R" else "#23854b"
+    color = "#246a9e" if direction == "read" else "#23854b"
     base, height = row+.36, .64
     edges = np.arange(len(values)+1)
     ys = base-height*np.r_[values,values[-1]]/cap
@@ -632,7 +654,7 @@ def draw_bandwidth_lane(ax, report, resource, row):
         else:
             boxes.append(box)
     # 区域编号在每个周期重复；明细图使用相同编号及周期内坐标。
-    prefix = "R" if resource=="L1_R" else "W"
+    prefix = ("R" if direction == "read" else "W") + ("B" if resource.endswith('_BUS') else '')
     for index,(a,b) in enumerate(bandwidth_regions(values[:report["ii_cycles"]]),1):
         for offset in range(0,len(values),report["ii_cycles"]):
             label((a+b)/2+offset,row-.02,f"{prefix}{index}")
@@ -640,8 +662,12 @@ def draw_bandwidth_lane(ax, report, resource, row):
         a,b,v = item["start"],item["end"],item["bytes_per_cycle"]
         width = (b-a)*ax.bbox.width/len(values)
         if width >= 38:
-            label((a+b)/2,row+.07,f"{v:g}")
-    return f"{'L1 读' if direction=='read' else 'L1 写'} B/c\n均 {values.mean():.1f} / 峰 {values.max():g} / 限 {cap:g}"
+            text = f"{100*v/cap:.1f}%" if resource.endswith('_BUS') else f"{v:g}"
+            label((a+b)/2,row+.07,text)
+    kind = '实际占用' if resource.endswith('_BUS') else '有效数据'
+    if resource.endswith('_BUS'):
+        return f"{'L1 读' if direction=='read' else 'L1 写'} {kind} (%)\n均 {100*values.mean()/cap:.1f}% / 峰 {100*values.max()/cap:.1f}% / 限 100%"
+    return f"{'L1 读' if direction=='read' else 'L1 写'} {kind} B/c\n均 {values.mean():.1f} / 峰 {values.max():g} / 限 {cap:g}"
 
 
 def bandwidth_contributors(report, resource):
@@ -721,6 +747,8 @@ def draw_bandwidth_details(config, report, output_dir):
                     label_regions.append((key,positions,baseline.copy(),part.copy()))
                 baseline = upper
             ax.stairs(v,np.arange(a,b+1),color="#152b3c",linewidth=.9)
+            bus = bandwidth_samples(report, resource+'_BUS')[a:b]
+            ax.stairs(bus,np.arange(a,b+1),color="#8b3293",linestyle='--',linewidth=1)
             ax.axhline(cap,color="#b35d4f",linestyle="--",linewidth=.8)
             ax.set_xlim(a,b); ax.set_ylim(-cap*.05,cap*1.25)
             ax.set_ylabel("B/cycle",fontsize=9)
@@ -773,7 +801,7 @@ def draw_bandwidth_details(config, report, output_dir):
         for index,a in enumerate(range(0,ii,64)):
             panel(fig.add_subplot(grid[index+1,column]),a,min(a+64,ii),True)
     fig.suptitle(f"L1 读写带宽及操作贡献 | 左读、右写，同一行对应同一时间区间 | II={ii} cycle",fontsize=22,y=.997)
-    fig.text(.045,.987,"黑线及上方数字=总带宽；彩色层内数字=该操作贡献，单位 B/cycle；图例标明操作[tile偏移]。负偏移表示前序tile。总图第k周期时刻=此处坐标+k×II，tile编号也加k。",fontsize=12)
+    fig.text(.045,.987,"黑线/数字/彩色层=有效数据带宽；紫色虚线=L1实际占用（Vector整端口拍）；红虚线=L1容量。单位 B/cycle；图例为操作[tile偏移]。总图第k周期坐标=此处坐标+k×II。",fontsize=12)
     path = output_dir/"bandwidth_detail.png"
     save_parameterized_figure(fig, path, config); plt.close(fig)
     return {"bandwidth_detail":path}
@@ -823,6 +851,14 @@ def make_report(config, operations, capacities, ii, lower_bound, total, pools):
             "peak_demand_per_cycle": float(amounts[resource].max()),
             "demand_per_period": float(amounts[resource].sum()),
         }
+        if resource in ('VECTOR_LD', 'VECTOR_ST'):
+            direction = 'read' if resource == 'VECTOR_LD' else 'write'
+            beat = config['vector'][direction+'_port_gbps']/frequency
+            unit_times[resource].update(
+                port_count=config['vector'][direction+'_ports'],
+                port_bytes_per_cycle=beat,
+                occupied_port_cycles_per_period=float(amounts[resource].sum()/beat),
+                peak_ports_in_use=float(amounts[resource].max()/beat))
     engine_times = {}
     for engine, resources in ENGINE_RESOURCES.items():
         union = np.logical_or.reduce([busy[r] for r in resources])
@@ -836,7 +872,7 @@ def make_report(config, operations, capacities, ii, lower_bound, total, pools):
             "definition": "内部物理单元及接口占用区间的并集，包含图中隐藏的Vector访存",
         }
     bandwidth = {}
-    for resource in ("L1_R", "L1_W"):
+    for resource in ("L1_R", "L1_W", "L1_R_BUS", "L1_W_BUS"):
         samples = np.tile(amounts[resource], periods)
         edges = np.r_[0, np.flatnonzero(np.diff(samples)) + 1, len(samples)]
         bandwidth[resource] = [
@@ -862,6 +898,8 @@ def make_report(config, operations, capacities, ii, lower_bound, total, pools):
         "l1_bandwidth_intervals": bandwidth,
         "scope": "完整有效KV tile的中间稳态，Q已在L1；不含首块初始化、最终归一化与写回",
         "assumptions": [
+            "Vector LD/ST 按单端口完整拍占用；同操作每周期最多一个端口，多端口仅允许不同操作并发；按拍释放，不模拟burst锁定或bank映射",
+            "L1_R/W为有效数据，L1_R_BUS/W_BUS为Vector整拍加Tensor/DMA流式需求；实际占用参与共享L1资源约束",
             "缩放常数c=1/sqrt(d_k)在初始化预计算；稠密mask从DDR经DMA加载，Vector从L1读取后执行独立ADD",
             "Q/A驻留L1；A由SCALE_A和ADD_A各读写一次并原地更新；m/ℓ及行向量保留寄存器",
             "Vector的FP32 score工作区仍需本地scratch，容量另列；不将其视为免费寄存器或计入L1",
@@ -1037,10 +1075,10 @@ def draw_execution_overview(config, operations, report, destination):
                     color="#143d59", linewidth=.7)
     bottom.set_xlim(0,report["window_cycles"])
     bw_labels = [draw_bandwidth_lane(bottom,report,r,row)
-                 for row,r in enumerate(("L1_R","L1_W"),3)]
-    capacity_labels = draw_capacity_rows(bottom,report,5)
-    bottom.set_yticks(range(5+len(capacity_labels)), ["DMA", "Tensor", "Vector"]+bw_labels+capacity_labels, fontsize=8)
-    bottom.set_ylim(4.5+len(capacity_labels),-.7); bottom.set_xlim(0,report["window_cycles"])
+                 for row,r in enumerate(("L1_R","L1_W","L1_R_BUS","L1_W_BUS"),3)]
+    capacity_labels = draw_capacity_rows(bottom,report,7)
+    bottom.set_yticks(range(7+len(capacity_labels)), ["DMA", "Tensor", "Vector"]+bw_labels+capacity_labels, fontsize=8)
+    bottom.set_ylim(6.5+len(capacity_labels),-.7); bottom.set_xlim(0,report["window_cycles"])
     label_dma(bottom, 0, report["window_cycles"], periodic=True)
     bottom.set_xticks(np.arange(config["plot"]["periods"]+1)*report["ii_cycles"])
     bottom.set_title("满流水：三引擎均为含 I/O 并集，包含跨 tile 重叠；竖线间隔为 II", loc="left", fontsize=15)
@@ -1120,7 +1158,7 @@ def draw(config, operations, report, destination):
     show_io = plot["show_hidden_vector_io"] or throttled
     if show_io:
         lanes += ["VECTOR_LD", "VECTOR_ST"]
-    lanes += ["Tensor union", "Vector union", "DMA union", "L1_R", "L1_W"]
+    lanes += ["Tensor union", "Vector union", "DMA union", "L1_R", "L1_W", "L1_R_BUS", "L1_W_BUS"]
     capacity_start = len(lanes)
     lanes += [f"{name} (KiB)" for name in report["l1_capacity"]["intervals"]]
     figsize = (plot["width_px"] / plot["dpi"], plot["height_px"] / plot["dpi"])
@@ -1159,7 +1197,7 @@ def draw(config, operations, report, destination):
         if row >= capacity_start:
             continue
         ax.axhspan(row - 0.45, row + 0.45, color="#f4f7fa", zorder=0)
-        if resource in ("L1_R", "L1_W"):
+        if resource in ("L1_R", "L1_W", "L1_R_BUS", "L1_W_BUS"):
             bandwidth_labels[resource] = draw_bandwidth_lane(ax,report,resource,row)
             continue
         if resource.endswith(" union"):
@@ -1280,7 +1318,7 @@ def draw(config, operations, report, destination):
     totals = " | ".join(f"{name} union {data['window_cycles']} c ({data['window_ns']:.1f} ns)"
                        for name,data in report["engines"].items())
     fig.text(0.08, 0.025, totals +
-             f"\nmask 从DDR加载；A驻留L1。L1固定预留 {report['l1_reserved_bytes']/1024:g} KiB，存活峰值 {report['l1_capacity']['live_peak_bytes']/1024:g} KiB；带宽行 B/cycle，容量行 KiB。"
+             f"\nmask 从DDR加载；A驻留L1。L1固定预留 {report['l1_reserved_bytes']/1024:g} KiB，存活峰值 {report['l1_capacity']['live_peak_bytes']/1024:g} KiB；有效带宽 B/cycle，实际占用为L1对应读/写上限的百分比，容量 KiB。"
              "\n同号表示数据依赖允许并行。指数两支共用 EXP，实际发射时间以泳道为准。虚线表示结果延迟。", fontsize=10)
     # 明确指定像素尺寸，避免 bbox_inches='tight' 改变请求的全尺寸输出。
     save_parameterized_figure(fig, destination, config)
@@ -1307,7 +1345,7 @@ def draw_statistics(config, report, output_dir):
     fig.subplots_adjust(left=0.07, right=0.95, top=0.82, bottom=0.13, wspace=0.25)
     compute_units = ["TENSOR"] + list(VECTOR_UNITS)
     io_units = ["TENSOR_LD", "TENSOR_ST", "VECTOR_LD", "VECTOR_ST",
-                "DMA_RD", "DMA_WR", "L1_R", "L1_W"]
+                "DMA_RD", "DMA_WR", "L1_R", "L1_W", "L1_R_BUS", "L1_W_BUS"]
     for ax, units, title in zip(axes, (compute_units, io_units),
                                ("各计算单元", "读写接口（包含隐藏的 Vector 访存）")):
         positions = np.arange(len(units))

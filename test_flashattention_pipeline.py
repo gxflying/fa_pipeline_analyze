@@ -7,10 +7,29 @@ import flashattention_pipeline as pipeline
 
 
 class PipelineTests(unittest.TestCase):
+    def test_partial_store_occupies_whole_port_and_blocks_second_transfer(self):
+        cfg = json.loads(pipeline.DEFAULT_CONFIG.with_name('flashattention_pipeline.fp16_inline.json').read_text())
+        ops, caps, _, _ = pipeline.make_model(cfg)
+        exp = next(o for o in ops if o.name == 'EXP_P')
+        self.assertEqual(exp.profiles['L1_W'].max(), 16)
+        self.assertEqual(exp.profiles['VECTOR_ST'].max(), 256)
+        self.assertEqual(exp.profiles['L1_W_BUS'].sum(), 512*256)
+        # 两个仅有16B的传输也不能拼在同一物理端口。
+        occupied = {'VECTOR_ST': np.array([256.])}
+        pattern = {'VECTOR_ST': np.array([256.])}
+        self.assertFalse(pipeline.feasible_phases(pattern, occupied, caps, 1)[0])
+        cfg['vector']['write_ports'] = 2
+        ops2, caps2, _, _ = pipeline.make_model(cfg)
+        self.assertTrue(pipeline.feasible_phases(pattern, occupied, caps2, 1)[0])
+        exp2 = next(o for o in ops2 if o.name == 'EXP_P')
+        np.testing.assert_array_equal(exp2.profiles['VECTOR_ST'], exp.profiles['VECTOR_ST'])
+        # 增加端口不能加速一条指令的流，只允许多条流并发。
+        self.assertEqual(exp2.issue_offsets, exp.issue_offsets)
+
     def test_parameter_caption_and_capacity_follow_frequency_and_interfaces(self):
         config = json.loads(pipeline.DEFAULT_CONFIG.with_name('flashattention_pipeline.fp16_inline.json').read_text())
         config['clock_ghz'] = 2.0
-        config['vector']['write_gbps'] = 512
+        config['vector']['write_ports'] = 2
         config['l1']['write_gbps'] = 768
         ops, caps, ii, lower, total, pools = pipeline.solve(config)
         report = pipeline.make_report(config, ops, caps, ii, lower, total, pools)
@@ -20,7 +39,7 @@ class PipelineTests(unittest.TestCase):
         self.assertAlmostEqual(report['units']['L1_W']['capacity_utilization'],
                                report['units']['L1_W']['demand_per_period']/ii/384)
         caption = '\n'.join(pipeline.parameter_caption(config))
-        self.assertIn('512 GB/s → 256 B/cycle', caption)
+        self.assertIn('256 GB/s/port × 2 ports → 256 B/cycle', caption)
         self.assertIn('768 GB/s → 384 B/cycle', caption)
         self.assertIn('200 GB/s → 70 B/cycle', caption)
         self.assertEqual(report['window_ns'], report['window_cycles']/2)
@@ -185,11 +204,12 @@ class PipelineTests(unittest.TestCase):
             self.assertGreaterEqual(arrived, (group + 1) * 256)
         cast = by_name["CVT_P"]
         self.assertEqual(cast.ready_offset, 65)
-        self.assertEqual(cast.profiles["VECTOR_ST"].sum(), 8192)
-        self.assertEqual(cast.profiles["VECTOR_ST"].max(), 128)
+        self.assertEqual(cast.profiles["L1_W"].sum(), 8192)
+        self.assertEqual(cast.profiles["VECTOR_ST"].max(), 256)
 
     def test_lower_bandwidth_recomputes_stream_and_schedule(self):
         self.config["l1"]["read_gbps"] = 128
+        self.config["vector"]["read_port_gbps"] = 128
         ops, caps, ii, lower, _, _ = pipeline.solve(self.config)
         scale = next(op for op in ops if op.name == "SCALE")
         self.assertEqual((scale.read_end, scale.ready_offset), (128, 129))
@@ -217,8 +237,8 @@ class PipelineTests(unittest.TestCase):
         by_name = {op.name: op for op in ops}
         self.assertEqual(by_name["ROWMAX"].work, 0)
         self.assertEqual(by_name["ROWSUM"].ready_offset, 0)
-        self.assertEqual(by_name["SCALE"].profiles["VECTOR_LD"].sum(), 5 * 4)
-        self.assertEqual(by_name["CVT_P"].profiles["VECTOR_ST"].sum(), 5 * 2)
+        self.assertEqual(by_name["SCALE"].profiles["L1_R"].sum(), 5 * 4)
+        self.assertEqual(by_name["CVT_P"].profiles["L1_W"].sum(), 5 * 2)
         self.assertEqual(len(by_name["QK"].issue_offsets), 2)
         pipeline.verify_schedule(ops, caps, ii)
 
@@ -229,6 +249,7 @@ class PipelineTests(unittest.TestCase):
 
     def test_output_bandwidth_and_extra_interface_latency(self):
         self.config["l1"]["write_gbps"] = 64
+        self.config["vector"]["write_port_gbps"] = 64
         ops, _, _, _ = pipeline.make_model(self.config)
         cast = next(op for op in ops if op.name == "CVT_P")
         self.assertEqual(cast.issue_offsets[:3], [0, 2, 4])
@@ -272,14 +293,15 @@ class PipelineTests(unittest.TestCase):
         config = pipeline.validate_config(json.loads(path.read_text()))
         ops, caps, ii, lower, _, _ = pipeline.solve(config)
         by_name = {op.name: op for op in ops}
-        self.assertEqual(lower,520)
+        # EXP_P 512 拍 + SCALE_A 128 拍 + ADD_A 128 拍，单store端口下界。
+        self.assertEqual(lower, 512+128+128)
         self.assertGreaterEqual(ii,lower)
         self.assertNotIn("CVT_P", by_name)
         self.assertEqual(by_name["SCALE"].issue_offsets[0], 3)
         self.assertEqual(by_name["ADD_A"].issue_offsets[0], 4)
-        self.assertEqual(by_name["SCALE"].profiles["VECTOR_LD"].sum(), 8192)
+        self.assertEqual(by_name["SCALE"].profiles["L1_R"].sum(), 8192)
         exp = by_name["EXP_P"]
-        self.assertEqual(exp.profiles["VECTOR_ST"].sum(), 8192)
+        self.assertEqual(exp.profiles["L1_W"].sum(), 8192)
         self.assertEqual(exp.write_start, 3)
         self.assertEqual(exp.ready - exp.start - exp.result_offset, 3)
         self.assertEqual(by_name["ROWSUM"].dependency_ready(exp), exp.start + exp.result_offset)

@@ -54,8 +54,6 @@
     "write_gbps": 512
   },
   "vector": {
-    "read_gbps": 256,
-    "write_gbps": 512,
     "input_latency_cycles": 1,
     "output_latency_cycles": 1,
     "units": {
@@ -103,7 +101,11 @@
         "parallelism": 64,
         "latency_cycles": 1
       }
-    }
+    },
+    "read_port_gbps": 256,
+    "write_port_gbps": 256,
+    "read_ports": 1,
+    "write_ports": 2
   },
   "scheduler": {
     "max_ii_cycles": 10000
