@@ -546,6 +546,200 @@ def capacity_report(config, operations, pools, ii):
             "scope":"中间稳态；最终O可在A区域内逐组归一化转换后写出，未另预留O"}
 
 
+def bandwidth_samples(report, resource):
+    values = np.zeros(report["window_cycles"])
+    for interval in report["l1_bandwidth_intervals"][resource]:
+        values[interval["start"]:interval["end"]] = interval["bytes_per_cycle"]
+    return values
+
+
+def bandwidth_regions(values):
+    """标记连续密集跳变区，不改变任何原始采样值。"""
+    edges = np.r_[0,np.flatnonzero(np.diff(values))+1,len(values)]
+    groups, begin = [], None
+    for a,b in zip(edges,edges[1:]):
+        if b-a <= 3:
+            if begin is None:
+                begin = int(a)
+        else:
+            if begin is not None and a-begin >= 8:
+                groups.append((begin,int(a)))
+            begin = None
+    if begin is not None and len(values)-begin >= 8:
+        groups.append((begin,len(values)))
+    return groups
+
+
+def draw_bandwidth_lane(ax, report, resource, row):
+    values = bandwidth_samples(report, resource)
+    cfg = report["config"]
+    direction = "read" if resource == "L1_R" else "write"
+    cap = cfg["l1"][direction+"_gbps"]/cfg["clock_ghz"]
+    color = "#246a9e" if resource == "L1_R" else "#23854b"
+    base, height = row+.36, .64
+    edges = np.arange(len(values)+1)
+    ys = base-height*np.r_[values,values[-1]]/cap
+    ax.fill_between(edges,ys,base,step="post",color=color,alpha=.17)
+    ax.step(edges,ys,where="post",color=color,linewidth=.55)
+    ax.axhline(base-height,color=color,linestyle="--",linewidth=.6,alpha=.6)
+    renderer = ax.figure.canvas.get_renderer()
+    boxes = []
+    def label(x,y,text,size=7):
+        item = ax.text(x,y,text,fontsize=size,ha="center",va="center",color="#183242",
+                       bbox=dict(facecolor="white",edgecolor="none",alpha=.8,pad=.3))
+        box = item.get_window_extent(renderer).expanded(1.12,1.05)
+        if any(box.overlaps(old) for old in boxes) or box.x0<ax.bbox.x0 or box.x1>ax.bbox.x1:
+            item.remove()
+        else:
+            boxes.append(box)
+    # 区域编号在每个周期重复；明细图使用相同编号及周期内坐标。
+    prefix = "R" if resource=="L1_R" else "W"
+    for index,(a,b) in enumerate(bandwidth_regions(values[:report["ii_cycles"]]),1):
+        for offset in range(0,len(values),report["ii_cycles"]):
+            label((a+b)/2+offset,row-.02,f"{prefix}{index}")
+    for item in report["l1_bandwidth_intervals"][resource]:
+        a,b,v = item["start"],item["end"],item["bytes_per_cycle"]
+        width = (b-a)*ax.bbox.width/len(values)
+        if width >= 38:
+            label((a+b)/2,row+.07,f"{v:g}")
+    return f"{'L1 读' if direction=='read' else 'L1 写'} B/c\n均 {values.mean():.1f} / 峰 {values.max():g} / 限 {cap:g}"
+
+
+def bandwidth_contributors(report, resource):
+    """展开所有与一个稳态周期相交的操作实例，保留来源而非只按总量合并。"""
+    ii = report["ii_cycles"]
+    sources = {}
+    for op in report["operations"]:
+        for a,b,rate in op["resource_intervals"].get(resource,[]):
+            for tile in range(math.floor(-b/ii)+1,math.ceil((ii-a)/ii)):
+                left,right = max(0,a+tile*ii),min(ii,b+tile*ii)
+                if left < right:
+                    key = f"{op['name']}[t{tile:+d}]"
+                    sources.setdefault(key,np.zeros(ii))[left:right] += rate
+    total = sum(sources.values(),np.zeros(ii))
+    np.testing.assert_allclose(total,bandwidth_samples(report,resource)[:ii],rtol=0,atol=1e-8)
+    return sources
+
+
+def draw_bandwidth_details(config, report, output_dir):
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Patch
+    configure_plot_fonts()
+    ii = report["ii_cycles"]
+    chunks = math.ceil(ii/64)
+    rows = chunks+1
+    plot = config["plot"]
+    height = max(plot["height_px"],rows*430+240)
+    fig = plt.figure(figsize=(plot["width_px"]/plot["dpi"],height/plot["dpi"]),dpi=plot["dpi"])
+    grid = fig.add_gridspec(rows,2,left=.045,right=.985,top=.975,bottom=.018,hspace=.95,wspace=.12)
+    report["bandwidth_contributors"] = {}
+    op_names = [o["name"] for o in report["operations"]]
+    palette = plt.get_cmap("tab20")
+    for column,(resource,direction) in enumerate((("L1_R","read"),("L1_W","write"))):
+        samples = bandwidth_samples(report,resource)
+        values = samples[:ii]
+        if not np.allclose(samples,np.tile(values,config["plot"]["periods"])):
+            raise ValueError("带宽明细的周期折叠与原始窗口不一致")
+        sources = bandwidth_contributors(report,resource)
+        source_records = {}
+        for key,series in sources.items():
+            edges = np.r_[0,np.flatnonzero(np.diff(series))+1,ii]
+            source_records[key] = [dict(start=int(a),end=int(b),bytes_per_cycle=float(series[a]))
+                                   for a,b in zip(edges,edges[1:]) if series[a]>0]
+        report["bandwidth_contributors"][resource] = source_records
+        cap = config["l1"][direction+"_gbps"]/config["clock_ghz"]
+        regions = bandwidth_regions(values)
+        prefix = "R" if resource=="L1_R" else "W"
+        def panel(ax,a,b,annotate):
+            v = values[a:b]
+            ax.set_xlim(a,b); ax.set_ylim(-cap*.05,cap*1.25)
+            baseline = np.zeros(b-a)
+            handles = []
+            label_regions = []
+            number_labels = []
+            for key,series in sources.items():
+                part = series[a:b]
+                if not np.any(part):
+                    continue
+                name = key.split("[")[0]
+                color = palette(op_names.index(name)%20)
+                upper = baseline+part
+                ax.fill_between(np.arange(a,b+1),np.r_[baseline,baseline[-1]],
+                                np.r_[upper,upper[-1]],step="post",color=color,alpha=.75)
+                handles.append(Patch(facecolor=color,label=key))
+                if annotate:
+                    # 来源数值或堆叠位置改变都必须重新分段。
+                    edges = np.r_[0,np.flatnonzero((np.diff(part)!=0)|(np.diff(baseline)!=0))+1,len(part)]
+                    for x,y in zip(edges,edges[1:]):
+                        if part[x] > 0:
+                            number_labels.append(ax.text(a+(x+y)/2,baseline[x]+part[x]/2,f"{part[x]:g}",
+                                    fontsize=7,ha="center",va="center",color="#102432"))
+                active = np.flatnonzero(part>0)
+                # 隔拍写出的同一操作只标一次；长时间空闲则分段标注。
+                cuts = np.r_[0,np.flatnonzero(np.diff(active)>3)+1,len(active)]
+                for left,right in zip(cuts,cuts[1:]):
+                    positions = active[left:right]
+                    label_regions.append((key,positions,baseline.copy(),part.copy()))
+                baseline = upper
+            ax.stairs(v,np.arange(a,b+1),color="#152b3c",linewidth=.9)
+            ax.axhline(cap,color="#b35d4f",linestyle="--",linewidth=.8)
+            ax.set_xlim(a,b); ax.set_ylim(-cap*.05,cap*1.25)
+            ax.set_ylabel("B/cycle",fontsize=9)
+            ax.set_xlabel("cycle（周期内坐标）",fontsize=9)
+            ax.grid(alpha=.18)
+            if handles:
+                ax.legend(handles=handles,loc="upper left",bbox_to_anchor=(0,-.32),
+                          ncol=4,fontsize=8,frameon=False,borderaxespad=0)
+            if annotate:
+                edges = np.r_[0,np.flatnonzero(np.diff(v))+1,len(v)]
+                for x,y in zip(edges,edges[1:]):
+                    ax.text(a+(x+y)/2,v[x]+cap*.035,f"{v[x]:g}",ha="center",va="bottom",fontsize=8)
+            renderer = fig.canvas.get_renderer()
+            occupied = [text.get_window_extent(renderer).expanded(1.05,1.05) for text in number_labels]
+            for key,positions,base,part in label_regions:
+                # 在来源区域内寻找不覆盖数值的放置点；薄层改用引线标注。
+                placed = False
+                for fraction in (.5,.3,.7):
+                    x = int(positions[min(len(positions)-1,int((len(positions)-1)*fraction))])
+                    for vertical in (.78,.22,.5):
+                        item = ax.text(a+x+.5,base[x]+part[x]*vertical,key,fontsize=9 if not annotate else 8,
+                                       fontweight="bold",ha="center",va="center",zorder=5)
+                        box = item.get_window_extent(renderer).expanded(1.07,1.08)
+                        low,high = ax.transData.transform((a+x,base[x]))[1],ax.transData.transform((a+x,base[x]+part[x]))[1]
+                        left = ax.transData.transform((a+positions[0],0))[0]
+                        right = ax.transData.transform((a+positions[-1]+1,0))[0]
+                        if (box.x0>=left and box.x1<=right and box.y0>=low and box.y1<=high
+                                and not any(box.overlaps(old) for old in occupied)):
+                            occupied.append(box); placed=True
+                            break
+                        item.remove()
+                    if placed:
+                        break
+                if not placed:
+                    x = int(positions[len(positions)//2])
+                    for level in (1.18,1.07,.96):
+                        item = ax.annotate(key,xy=(a+x+.5,base[x]+part[x]/2),
+                                           xytext=(a+x+.5,cap*level),fontsize=7,fontweight="bold",
+                                           ha="center",va="center",arrowprops=dict(arrowstyle="-",lw=.5),
+                                           bbox=dict(facecolor="white",edgecolor="none",alpha=.8,pad=.4))
+                        box = item.get_window_extent(renderer)
+                        if not any(box.overlaps(old) for old in occupied):
+                            occupied.append(box); break
+                        item.remove()
+            ids = [f"{prefix}{j}=[{s},{e})" for j,(s,e) in enumerate(regions,1) if s<b and e>a]
+            ax.set_title(f"{'读' if column==0 else '写'} [{a}, {b})  "+ "  ".join(ids),fontsize=11,loc="left")
+        full = fig.add_subplot(grid[0,column]); panel(full,0,ii,False)
+        for j,(a,b) in enumerate(regions,1):
+            full.text((a+b)/2,cap*1.1,f"{prefix}{j}",ha="center",fontsize=11)
+        for index,a in enumerate(range(0,ii,64)):
+            panel(fig.add_subplot(grid[index+1,column]),a,min(a+64,ii),True)
+    fig.suptitle(f"L1 读写带宽及操作贡献 | 左读、右写，同一行对应同一时间区间 | II={ii} cycle",fontsize=22,y=.997)
+    fig.text(.045,.987,"黑线及上方数字=总带宽；彩色层内数字=该操作贡献，单位 B/cycle；图例标明操作[tile偏移]。负偏移表示前序tile。总图第k周期时刻=此处坐标+k×II，tile编号也加k。",fontsize=12)
+    path = output_dir/"bandwidth_detail.png"
+    fig.savefig(path,dpi=plot["dpi"]); plt.close(fig)
+    return {"bandwidth_detail":path}
+
+
 def draw_capacity_rows(ax, report, first_row):
     import matplotlib.pyplot as plt
     info = report["l1_capacity"]
@@ -799,17 +993,11 @@ def draw_execution_overview(config, operations, report, destination):
         # 精确并行数轮廓，区别连续满忙与内部并行。
         bottom.plot(np.arange(len(count)), row+.32-.1*count/max(1, count.max()),
                     color="#143d59", linewidth=.7)
-    for row, r in enumerate(("L1_R", "L1_W"), start=3):
-        for interval in report["l1_bandwidth_intervals"][r]:
-            a, b, rate = interval["start"], interval["end"], interval["bytes_per_cycle"]
-            bottom.broken_barh([(a,b-a)], (row-.29,.58),
-                              facecolors=plt.get_cmap("Greens")(.12+.7*rate/max(
-                                  1, report["units"][r]["peak_demand_per_cycle"])))
-        bottom.text(report["window_cycles"]*.99, row,
-                    f"峰值 {report['units'][r]['peak_demand_per_cycle']:g} B/cycle",
-                    ha="right", va="center", fontsize=10)
+    bottom.set_xlim(0,report["window_cycles"])
+    bw_labels = [draw_bandwidth_lane(bottom,report,r,row)
+                 for row,r in enumerate(("L1_R","L1_W"),3)]
     capacity_labels = draw_capacity_rows(bottom,report,5)
-    bottom.set_yticks(range(5+len(capacity_labels)), ["DMA", "Tensor", "Vector", "L1 读", "L1 写"]+capacity_labels, fontsize=10)
+    bottom.set_yticks(range(5+len(capacity_labels)), ["DMA", "Tensor", "Vector"]+bw_labels+capacity_labels, fontsize=8)
     bottom.set_ylim(4.5+len(capacity_labels),-.7); bottom.set_xlim(0,report["window_cycles"])
     label_dma(bottom, 0, report["window_cycles"], periodic=True)
     bottom.set_xticks(np.arange(config["plot"]["periods"]+1)*report["ii_cycles"])
@@ -923,24 +1111,14 @@ def draw(config, operations, report, destination):
     if caption_width > available_width:
         caption.set_fontsize(caption.get_fontsize() * available_width / caption_width)
     outside_boxes = []
+    bandwidth_labels = {}
     colors = plt.get_cmap("Pastel1").colors
     for row, resource in enumerate(lanes):
         if row >= capacity_start:
             continue
         ax.axhspan(row - 0.45, row + 0.45, color="#f4f7fa", zorder=0)
         if resource in ("L1_R", "L1_W"):
-            peak = report["units"][resource]["peak_demand_per_cycle"]
-            palette = plt.get_cmap("Blues" if resource == "L1_R" else "Greens")
-            for interval in report["l1_bandwidth_intervals"][resource]:
-                a, b, rate = interval["start"], interval["end"], interval["bytes_per_cycle"]
-                color = palette(0.13 + 0.42 * rate / max(1, peak)) if rate else "#ffffff"
-                ax.broken_barh([(a, b-a)], (row-0.23, 0.46), facecolors=color,
-                               edgecolors="#788b91", linewidth=0.5)
-                label = ax.text((a+b)/2, row, f"{rate:g}", va="center", ha="center",
-                                fontsize=8, color="#142934")
-                if label.get_window_extent(renderer).width + 5 > (b-a)*ax.bbox.width/window:
-                    label.set_y(row-0.25)
-                    label.set_va("bottom")
+            bandwidth_labels[resource] = draw_bandwidth_lane(ax,report,resource,row)
             continue
         if resource.endswith(" union"):
             continue
@@ -1038,8 +1216,7 @@ def draw(config, operations, report, destination):
     ax.set_xlim(0, window)
     draw_capacity_rows(ax, report, capacity_start)
     ax.set_ylim(len(lanes)-0.5, -0.8)
-    lane_labels = {"L1_R": "L1 读 (B/cycle)", "L1_W": "L1 写 (B/cycle)"}
-    ax.set_yticks(range(len(lanes)), [lane_labels.get(lane, lane) for lane in lanes], fontsize=10)
+    ax.set_yticks(range(len(lanes)), [bandwidth_labels.get(lane, lane) for lane in lanes], fontsize=9)
     ax.set_xticks(np.arange(plot["periods"]+1)*ii)
     ax.grid(axis="x", color="#cad4df", linewidth=0.7)
     ax.set_xlabel(f"Time (cycles); 1 cycle = {1/config['clock_ghz']:g} ns", fontsize=11)
@@ -1180,13 +1357,14 @@ def main():
     overview_path = args.output_dir / "execution_overview.png"
     draw_execution_overview(config, operations, report, overview_path)
     statistics_paths["execution_overview"] = overview_path
+    statistics_paths.update(draw_bandwidth_details(config,report,args.output_dir))
     report["png"] = {"path": str(png.resolve()), "width_px": config["plot"]["width_px"],
                      "height_px": config["plot"]["height_px"]}
-    report["statistics_png"] = {
-        name: {"path": str(path.resolve()), "width_px": config["plot"]["width_px"],
-               "height_px": config["plot"]["height_px"]}
-        for name, path in statistics_paths.items()
-    }
+    from PIL import Image
+    report["statistics_png"] = {}
+    for name,path in statistics_paths.items():
+        with Image.open(path) as im:
+            report["statistics_png"][name] = dict(path=str(path.resolve()),width_px=im.width,height_px=im.height)
     report_file = args.output_dir / "report.json"
     report_file.write_text(json.dumps(report, ensure_ascii=False, indent=2)+"\n", encoding="utf-8")
     print(f"II={ii} cycle/tile；资源下界={lower}；L1槽位={total/1024:g} KiB")

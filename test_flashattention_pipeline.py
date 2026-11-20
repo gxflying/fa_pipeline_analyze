@@ -7,6 +7,31 @@ import flashattention_pipeline as pipeline
 
 
 class PipelineTests(unittest.TestCase):
+    def test_bandwidth_contributors_preserve_identity_and_cross_period_tiles(self):
+        report = {"ii_cycles":4,"window_cycles":4,
+                  "operations":[
+                      {"name":"A","resource_intervals":{"L1_R":[[3,5,16]]}},
+                      {"name":"B","resource_intervals":{"L1_R":[[1,3,16]]}}],
+                  "l1_bandwidth_intervals":{"L1_R":[{"start":0,"end":4,"bytes_per_cycle":16}]}}
+        sources = pipeline.bandwidth_contributors(report,"L1_R")
+        self.assertEqual(set(sources),{"A[t-1]","A[t+0]","B[t+0]"})
+        np.testing.assert_array_equal(sources["A[t-1]"],[16,0,0,0])
+        np.testing.assert_array_equal(sources["A[t+0]"],[0,0,0,16])
+        np.testing.assert_array_equal(sources["B[t+0]"],[0,16,16,0])
+        np.testing.assert_array_equal(sum(sources.values()),[16,16,16,16])
+
+    def test_bandwidth_view_preserves_samples_and_marks_dense_regions(self):
+        values = np.r_[np.full(10,96),np.tile([256,128],8),np.zeros(6)]
+        self.assertEqual(pipeline.bandwidth_regions(values),[(10,26)])
+        self.assertEqual(pipeline.bandwidth_regions(np.zeros(20)),[])
+        self.assertEqual(pipeline.bandwidth_regions(np.tile([0,16],6)),[(0,12)])
+        report = {"window_cycles":len(values), "l1_bandwidth_intervals":{"L1_R":[]}}
+        edges = np.r_[0,np.flatnonzero(np.diff(values))+1,len(values)]
+        report["l1_bandwidth_intervals"]["L1_R"] = [
+            dict(start=int(a),end=int(b),bytes_per_cycle=float(values[a]))
+            for a,b in zip(edges,edges[1:])]
+        np.testing.assert_array_equal(pipeline.bandwidth_samples(report,"L1_R"),values)
+
     def test_mask_a_traffic_and_slot_pool_capacity(self):
         cfg = json.loads(pipeline.DEFAULT_CONFIG.with_name("flashattention_pipeline.fp16_inline.json").read_text())
         ops,caps,ii,lower,total,pools = pipeline.solve(cfg)
