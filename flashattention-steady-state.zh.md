@@ -234,6 +234,8 @@ $$
 
 ## 7. Vector 流式访存与每类单元一份的当前模型
 
+本节原算例保留早期流量口径；当前脚本已采用 Tensor 流式读写、独立 MASK 加法和 A 的 L1 回写，容量及新增流量以第 9 节为准。
+
 本节描述执行资源与访存模型；实际执行时间的统计及总图口径见第 8 节。
 
 MUL、ADD、SUB、MAX、CVT、EXP、DIV、RCP、SQRT、REDMAX、REDSUM 各有一份物理资源，用独立的 $P_u,L_u$ 表示吞吐和结果延迟。同类型不同步骤在该资源上排队，不同类型可以并发。REDMAX 与 REDSUM 默认各为 64 个二元操作/cycle，EXP/DIV/RCP/SQRT 各为 8 元素/cycle，其余各为 64 元素/cycle。
@@ -326,9 +328,251 @@ $$
 
 脚本新增 execution_overview.png，使用与原泳道相同的调度结果：
 
-1. 上部展示稳态排程中的单 tile 轨迹，保留真实空闲与等待。DMA/Tensor/Vector 主行使用含 I/O 并集，Vector 下方按物理计算资源展开，每类只有一行，公式标注在操作上方。主行色深按各行峰值归一化，表达该行同时活动资源数；跨行绝对并行度以右侧数值为准。
+1. 上部展示稳态排程中的单 tile 轨迹，保留真实空闲与等待。Tensor 行只显示 QK/PV 计算；DMA/Vector 主行使用含 I/O 并集，Vector 下方按物理计算资源展开，每类只有一行，公式标注在操作上方。主行色深按各行峰值归一化，表达该行同时活动资源数；跨行绝对并行度以右侧数值为准。
 2. 右侧列出单 tile 的计算工作量、计算忙碌并集、引擎完成跨度和计算并行度，并给出 ADD_L / ADD_A 的实际输入就绪 max 与启动时刻。
 3. 下部展示多个完整 II 的稳态引擎活动与 L1 带宽。计算跨窗口的前后 tile，避免漏掉跨周期占用；时间竖线标记 II。跨 tile 并行和单 tile 算法并行分别呈现。
 
 单 tile 轨迹不是孤立运行时的最短延迟；当前排程器给出可行周期调度，下界匹配只能证明模型内 II 最优，不能证明所有单 tile 完成跨度最短。初始化、最终归一化和输出写回仍不在中间稳态统计范围。
+
+## 9. 完整存储清单、A 回写与每种数据独立槽池
+
+### 9.1 数据放置与审计范围
+
+“Vector 本地”不等于已经证明所有数据能放进寄存器。当前明确区分 L1、行向量寄存器、较大的本地 scratch。下表覆盖一个 Q tile 扫描 KV 的前向过程；容量不包括训练反向保存、其他请求及实现相关队列。
+
+| 数据 | 维度与精度 | 放置及生命周期 |
+|---|---|---|
+| Q | $M d_k b_Q$ | L1 常驻，公共一份；初始加载不在中间稳态 |
+| K、V | $N d_k b_K$、$N d_v b_V$ | 各自独立 L1 槽池，DMA 开始预留，Tensor 最后读取后释放 |
+| mask | $MN b_{\rm vec}$ | 新增独立 L1 槽池；当前配置为外部稠密加性 mask，DDR DMA 加载，MASK ADD 流式读取；不是免费生成的 causal mask |
+| X（QK 输出，原 S 槽名称） | $MN b_S$ | L1 的 S 槽池，Tensor 生产开始预留，Vector 最后读后释放 |
+| H、加 mask 后的 S、U、宽精度 P | 每个 $MN b_{\rm vec}$ | 本地 score scratch 按阶段就地覆盖；P 保留至 ROWSUM 和窄化均完成。不把这些数组默认为小寄存器，也不重复计入 L1 |
+| 窄格式 P | $MN b_P$ | L1 P 槽池，EXP_P 随路写出或 CVT_P 显式写出，PV 最后读取后释放 |
+| Y | $Md_v b_Y$ | L1 Y 槽池，PV 生产开始预留，Vector 最后读取后释放 |
+| 显式转换后的宽格式 Y | $Md_v b_{\rm vec}$ | 仅显式转换模式需要本地 scratch，单独报告；随路转换只需组级暂存 |
+| A 及 $\widetilde A$ | $Md_v b_{\rm vec}$ | 同一 L1 常驻区原地更新，跨 tile 反馈串行保护，不再假设完整 A 常驻寄存器 |
+| $m,\ell,r,\Delta m,\alpha,z,\widetilde\ell$ | 各为 M 个元素 | 寄存器行向量，需保留旧 m 及所有在途版本；m/ℓ 基础容量为 $2Mb_{\rm vec}$，不是全部寄存器容量 |
+| 最终 O、可选 LSE | $Md_v b_O$、M 个元素 | 终结阶段；O 可在 A 区按组归一化、转换并写出，故稳态未另分配 O；若实现要求独立缓冲或保存 LSE，另加容量 |
+| 缩放常数 $c=1/\sqrt{d_k}$ | 标量 | 初始化计算并驻寄存器；不为每个 tile 重算 |
+| Tensor 操作数复用及累加器、转换/流式 FIFO | 与微块及延迟有关 | 执行引擎内部资源；当前模型假定足够，并非 L1 容量，尚未做精确内部容量约束 |
+
+例如 FP16 Tensor / FP32 Vector、$M=N=64,d_k=d_v=128$：Q/A 常驻分别为 16/32 KiB；K/V/mask 每份各 16 KiB，S/P 每份各 8 KiB，Y 每份 16 KiB。m/ℓ 基础寄存器容量合计 0.5 KiB。score scratch 每份 16 KiB，按其真实生命周期另算在途份数。报告 l1_capacity.local_scratch 明确列出较大的本地缓冲需求；尚未给本地 scratch 配置容量上限，不能把 L1 可行等同于全部片上存储均可行。
+
+### 9.2 A 的流式读写与固定延迟
+
+两个算术步骤保持独立：
+
+1. SCALE_A：从 L1 读 $A_{j-1}$，乘 $\alpha_j$，将 $\widetilde A_j$ 写回同一 A 区。
+2. ADD_A：从 L1 读取 $\widetilde A_j$ 和 Y，完成相加并将 $A_j$ 写回同一 A 区。
+
+两步之间以写回完成交付依赖，下一 tile 的 SCALE_A 也必须等待上一 tile 的 ADD_A 最后写回完成。因此单份 A 区不会被下一 tile 提前覆盖；这是保守的整操作反馈，不是逐组转发。每 tile 的 A 流量为
+
+$$
+D_{A,r}=2Md_vb_{\rm vec},\qquad D_{A,w}=2Md_vb_{\rm vec}.
+$$
+
+当前尺寸下 A 共增加 64 KiB L1 读和 64 KiB L1 写。之所以不是一次读写，是为了避免两个独立操作之间隐含持有整块 $\widetilde A$ 的寄存器。若将来实现组级 MUL→ADD 转发，则必须同步建模 FIFO 与依赖后再减少该流量。
+
+mask 每 tile 另增加 $MN b_{\rm vec}$ 的 DDR 读、L1 写和 L1 读。A 不逐 tile 从 DDR 加载，初始清零在初始化阶段。
+
+JSON 已有 vector.input_latency_cycles / vector.output_latency_cycles，默认均为 1；继续使用这两个参数，不增加同义键。对一组数据，$R=\lceil d_r/B_r\rceil$、$W=\lceil d_w/B_w\rceil$，输入就绪为
+
+$$
+t_{\rm issue}=t_{\rm read,start}+R+L_{\rm in}-1+L_{\rm cast,in}.
+$$
+
+写入从计算结果就绪后 $L_{\rm out}-1+L_{\rm cast,out}$ 开始，耗时 W。默认一拍访问含 1 cycle 延迟；参数设为 2 则额外增加 1 cycle。组间隔为 $\max(1,R,W)$，持续带宽不足仍会限速。ADD_A 的读字节为 A 与 Y 两个输入之和；随路转换只改变 Y 的格式，A 始终保持 Vector 精度。Tensor 使用相同的输入/输出固定延迟约定。
+
+### 9.3 每种数据独立槽池
+
+不用“每个流水固定分配一整套 K/V/临时数据”的方案。对每种对象 $x\in\{K,V,mask,S,P,Y\}$，设每份大小 $B_x$，tile 0 的分配和释放时刻为 $a_x,f_x$，生命周期 $L_x=f_x-a_x$，稳态启动间隔为 II。tile j 占用区间为
+
+$$
+I_{x,j}=[a_x+jII,\ f_x+jII),\qquad
+n_x=\max\left(1,\left\lceil L_x/II\right\rceil\right).
+$$
+
+实现可用槽编号 $j\bmod n_x$。同一槽下一次分配在 $n_xII$ 后，不早于上次释放，因此可以安全复用。半开区间允许某 cycle 释放旧对象并在同一边界分配新对象。每种数据独立轮转，其槽数不必相同。
+
+$$
+C_{\rm reserved}
+=Md_kb_Q+Md_vb_{\rm vec}+\sum_x n_xB_x.
+$$
+
+Q 和 A 常驻只计一次；m/ℓ 在寄存器不计 L1。对象分配保守地取生产操作开始，释放取最后一次 L1 读取完成，而不是计算结果完成；生成前的预留也计占用。Tensor 和 Vector 流式消费者采用各自 read_end；整个对象读完才释放槽，不按字节逐步回收。
+
+脚本用当前排程重新计算生命周期和槽数，并检查 $C_{\rm reserved}\le C_{\rm L1}$。更改带宽、延迟、dtype 或 II 后必须重算，不能沿用旧槽数。
+
+### 9.4 容量时间线
+
+$$
+c_x(t)=B_x\sum_{j\in\mathbb Z}\mathbf1[t\in I_{x,j}],\qquad
+C_{\rm live}(t)=C_Q+C_A+\sum_x c_x(t).
+$$
+
+图中在 L1 读写带宽下增加 Q+A、K、V、mask、S、P、Y、总存活容量行，单位 KiB，相邻相同数值区间合并。事件包含窗口开始前的在途 tile。右侧另列固定预留、存活峰值和配置上限。由于各槽池峰值可能错开，$\max_t C_{\rm live}(t)\le C_{\rm reserved}$，不能用存活峰值替代固定槽池容量。当前未对槽大小做额外地址对齐。
+
+本次 FP16 Tensor / FP32 Vector、随路转换 2 cycle、Vector 输入/输出各 1 cycle 的运行结果：当前调度器找到 $II=1227$ cycle/tile，资源下界 520，不能视为最优吞吐。K/V/mask/S/P/Y 槽数分别为 1/2/1/1/1/1，合计 96 KiB；Q+A 为 48 KiB，固定 L1 预留 144 KiB，存活峰值也是 144 KiB。本地 score scratch 另外需要 1 份 16 KiB，不计入该 144 KiB。这些数值依赖当前排程，不是硬件参数的固定常数。
+
+## 10. 当前仿真系统说明与统计口径索引
+
+本节对应当前 flashattention_pipeline.py，实现范围以本节及第 9 节为准；前文的历史算例不能直接作为当前配置的仿真结果。
+
+### 10.1 系统定位、输入与输出
+
+系统是 JSON 驱动的、以整数 cycle 为时间轴的资源受限周期排程模型，不是执行真实 Tensor/Vector 指令的硬件模拟器，也不计算 attention 数值结果。模型对象是一个 head、同一 Q tile 扫描连续 KV tile 的中间稳态。不同 tile 共享 Q 和跨块 A/m/ℓ 状态，不能直接解释为不同请求同时执行。
+
+| 环节 | 当前实现及职责 |
+|---|---|
+| 参数校验 | validate_config：校验 JSON 键、正数、精度及转换模式；配置不支持的 mask 来源会报错 |
+| 数据布局 | numeric_layout：确定各对象在 L1/DDR 的元素宽度，精度变化用于字节量和转换延迟 |
+| 单 tile 建模 | make_model：建立操作、依赖、逐 cycle 资源需求及 L1 生命周期关联 |
+| 周期排程 | solve：从资源下界递增搜索 II，按固定拓扑顺序为每个操作选最早可行周期相位 |
+| 可行性检查 | verify_schedule：独立检查前驱、跨 tile 反馈及展开周期内的资源超额 |
+| 容量与统计 | buffer_usage、capacity_report、make_report、execution_overview：计算槽池、带宽、资源占用与引擎并集 |
+| 输出 | report.json 为可复核的数值和事件记录；pipeline.png、execution_overview.png、unit_statistics.png、engine_statistics.png 为图形视图 |
+
+主要配置分为 shape、dtype_bytes/numeric、tensor、vector、ddr、l1、mask、scheduler、plot。Tensor/Vector 输入与输出固定延迟分别配置，转换额外延迟独立配置；不把固定延迟等同于每组服务间隔。
+
+### 10.2 单位、事件与可消费时刻
+
+令 $f$ 为 clock_ghz，单位 GHz；一个 cycle 为 $1/f$ ns。配置带宽 $B$ 的单位为十进制 GB/s，模型中的容量为
+
+$$
+c_{\rm interface}=\frac{B}{f}\quad\mathrm{B/cycle},\qquad
+c_{\rm DDR}=\frac{\eta B_{\rm DDR}}{f}.
+$$
+
+$\eta$ 为 DDR efficiency。容量图使用 KiB，即 1024 B。所有区间为半开区间 $[a,b)$，长度为 $b-a$ cycle。
+
+每个操作 o 保存启动时刻 $s_o$、发射组偏移、结果可见偏移及每个资源的需求序列 $p_{o,r}(\tau)$。计算资源的需求为 0/1，接口需求为 B/cycle；操作没有使用某资源时需求为零。
+
+- start：操作开始，可以先发生输入传输。
+- issue_offsets：计算组真正发射的偏移，不等于 start。
+- result_ready：本地计算结果就绪。
+- ready：包括必要尾部写出/转换后，默认消费者能够接收的时刻。
+- read_end：最后一次 L1 读取完成，用于释放输入槽。
+
+默认消费者等待前驱 ready；标记为 local_dependencies 的消费者可等待本地 result_ready。例如 ROWSUM 可用宽精度 P，而 PV 必须等窄格式 P 写入 L1。报告中的 operation.formula 是周期建模说明，attention_equation 是计算公式，两者用途不同。
+
+### 10.3 周期资源约束、下界与吞吐
+
+令周期为 I，资源 r 的容量为 $c_r$，其周期化需求为
+
+$$
+d_r(t;I)=\sum_o\sum_{j\in\mathbb Z}
+p_{o,r}(t-s_o-jI),\qquad d_r(t;I)\le c_r.
+$$
+
+无限整数 j 表示已进入稳态的前后 tile，实际只有与窗口相交的有限项非零。调度还检查数据依赖，并约束前一 tile 的 MAX、ADD_L、ADD_A 分别在下一 tile 的 MAX、SCALE_L、SCALE_A 开始前完成。
+
+报告 resource_lower_bound_cycles 为平均资源需求下界：
+
+$$
+I_{\rm res}=\max\left(1,\left\lceil
+\max_r \frac{\sum_o\sum_\tau p_{o,r}(\tau)}{c_r}
+\right\rceil\right).
+$$
+
+这个下界不包含完整的依赖环延迟、瞬时冲突及缓冲限制，不能当作已实现 II。调度器将这些约束在候选排程中进一步检查。
+
+当前搜索固定操作顺序，已安排的操作不回溯，且每条操作的内部读写节拍预先确定。失败只表示该启发式未找到对应 II 的排程，不代表不存在。仅当实际找到的 I 等于上述下界时，proven_optimal_in_model 才为真；它证明的是当前模型内 II 最优，不证明真实硬件吞吐或单 tile 延迟最优。
+
+$$
+R_{\rm tile}=10^9f/I\quad\mathrm{tile/s},\qquad
+R_{\rm score}=MN\,10^9f/I\quad\mathrm{score/s}.
+$$
+
+此吞吐只适用于足够长的稳态。完整请求还需初始化、填充、排空、最终归一化和输出写回，不应直接以 tile 数乘 II 替代完整请求延迟。
+
+### 10.4 执行单元、接口与带宽统计
+
+令 $a_r(t)=\mathbf1[d_r(t)>0]$，统计窗口为 $T=HI$ cycle，其中 H 为 plot.periods。
+
+| report.json 字段 | 数学定义与含义 |
+|---|---|
+| units[r].per_period_cycles | $B_r=\sum_{t=0}^{I-1}a_r(t)$，每周期活动时间 |
+| window_cycles / window_ns | $HB_r$ / $HB_r/f$ |
+| utilization | $B_r/I$，活动周期比例 |
+| issue_cycles_per_period | $\sum_{o:\,unit(o)=r}\#issue\_offsets_o$，计算组发射次数；当前单资源每拍最多发射一组，等于实际发射周期数 |
+| demand_per_period | $D_r=\sum_{t=0}^{I-1}d_r(t)$；计算资源为占用 resource-cycle，接口为总字节 |
+| peak_demand_per_cycle | $\max_t d_r(t)$；接口单位 B/cycle |
+
+接口 utilization 是“有流量的周期比例”，不是带宽饱和度。平均带宽及平均带宽利用率应另由
+
+$$
+\overline B_r=D_r/I,\qquad
+U_{\rm bw,r}=D_r/(Ic_r)
+$$
+
+计算。例如接口连续活动但每拍只用 16/256 B 时，活动利用率为 100%，带宽利用率只有 6.25%。
+
+L1_R/L1_W 是 DMA、Tensor、Vector 的实际传输需求之和，读写各自独立约束。带宽图显示 $d_{\rm L1}(t)$，相邻等值区间合并，既不是峰值外推，也不是只统计某个引擎。接口字节只在本接口口径统计一次；跨层读取同一数据是不同传输，不能把所有接口字节相加称作“唯一数据量”。
+
+### 10.5 引擎时间、并行度与完成跨度
+
+对选定资源集合 E，令 $n_E(t)=\sum_{r\in E}a_r(t)$：
+
+$$
+W_E=\sum_t n_E(t),\qquad
+B_E=\sum_t\mathbf1[n_E(t)>0],\qquad
+\overline P_E=W_E/B_E,\qquad
+P_{\rm peak,E}=\max_t n_E(t).
+$$
+
+空集时并行度取零。W 单位为 resource-cycle，是累计工作量；B 单位为 cycle，是忙碌并集。W 可以超过窗口长度，B 不可以。计算指令因供数不足而持有单元的停顿计入两者，不能将这些数值解释为有效算术吞吐。
+
+| 口径 | 资源集合 |
+|---|---|
+| Tensor compute_only / primary | TENSOR |
+| Vector compute_only / primary | MUL、ADD、SUB、MAX、EXP、DIV、RCP、SQRT、CVT、REDMAX、REDSUM |
+| Tensor including_io | TENSOR、TENSOR_LD、TENSOR_ST |
+| Vector including_io | 上述计算单元及 VECTOR_LD、VECTOR_ST |
+| DMA | DMA_RD、DMA_WR；engine_statistics 的 compute_only 为零，而 execution_overview 的 primary 按搬运接口统计 |
+
+最后一行是两个图的术语差异：DMA primary 不是算术时间。并行度也只是所选物理资源同时活动的数量，不是指令级并行度或吞吐提升倍数。
+
+单 tile 的 occupancy_span_cycles 是最早活动拍到最后活动拍结束的跨度；completion_span_cycles 为
+
+$$
+C_E=\max_{o\in E}ready_o-\min_{o\in E}start_o.
+$$
+
+后者包含输入、依赖等待及结果尾延迟。两者均不等于忙碌并集。单 tile 图跟踪稳态排程中的一个 tile，不是孤立运行最短延迟；稳态图则把多个 tile 投影到统一窗口，不能把跨 tile 重叠误认为 tile 内全部分支并行。
+
+汇合点对真实直接前驱使用
+
+$$
+g_v=\max_{u\in pred(v)}q_{uv},\qquad
+wait_v=s_v-g_v.
+$$
+
+$q_{uv}$ 为该消费者对应的可消费时刻。report 中 dependency_gate 为 g，scheduled_wait_cycles 为 wait。wait 混合了资源和相位约束，当前未做逐项因果归因。分支独立、同起点且没有资源冲突时才能直接写 $\max(T_1,T_2)$。
+
+### 10.6 容量字段与图形对应
+
+第 9 节给出了槽池公式。l1_pools 的 bytes_per_slot、slots、allocate_cycle、release_cycle 分别对应 $B_x,n_x,a_x,f_x$，lifetime_cycles 为 $f_x-a_x$。l1_reserved_bytes 为公共区加所有固定槽池；l1_capacity.live_peak_bytes 为全时间线上同时存活容量的峰值。
+
+| 输出图 | 主要口径 |
+|---|---|
+| pipeline.png | 稳态物理单元占用；引擎 union 含 I/O；带宽和槽池存活容量按同一时间轴显示 |
+| execution_overview.png 上半 | 单 tile；Tensor 只画 QK/PV 计算，Vector/DMA 主行含 I/O，Vector 子行按计算资源展开 |
+| execution_overview.png 下半 | 多 tile 稳态三引擎含 I/O 并集、L1 带宽及存活容量 |
+| unit_statistics.png | 每个资源活动时间；计算单元另列发射时间 |
+| engine_statistics.png | 同一稳态窗口的含 I/O 并集与纯计算并集 |
+
+固定预留容量不随当前存活量减少而释放给其他槽池。容量图按完整对象预留，不是已经写入的有效字节数量。scratch 在报告中另列，既不加到 L1，也不表示可以省略真实硬件存储。
+
+### 10.7 当前假设、限制与结果解释
+
+1. **存储边界**：Q/A 常驻 L1，mask 从 DDR 加载，A 的两个独立步骤各读写一次；行状态在寄存器，score/Y 宽格式工作区按第 9 节放在本地 scratch。尚未限制 scratch、寄存器、Tensor 累加器及 FIFO 容量和端口，因此不是完整片上存储可行性证明。
+2. **固定读写时序**：Vector 按组构造固定读写序列，欠供时持有计算单元；没有动态带宽仲裁、独立 store 队列、运行时反压事件或逐组指令间转发。512 B 的总流量跨两拍平均可供给，不意味着当前分组取整模型一定能达到该平均速率。
+3. **Tensor 复用**：按唯一输入字节均匀分配至微 GEMM 发射组，假定理想本地复用；最后 K round 才写最终输出。没有模拟真实 bank、缓存行、操作数访问顺序或部分和溢出。流式读写的字节守恒不等于真实微架构实现验证。
+4. **依赖保守性**：大多数消费者等待整块就绪；当前 SCALE_A 仍额外等待 PV，SCALE_L 仍等待 ROWSUM，这些是实现中的保守依赖，不是算法必需依赖。A 的跨 tile 更新也按最后写回完成串行保护，限制了可搜索的调度空间。
+5. **带宽模型**：L1 读写独立、共享总带宽；DDR 使用固定效率系数。没有 DDR 时序、bank 冲突、缓存 miss、突发启动开销及请求队列建模。
+6. **精度模型**：FP16/BF16/FP32 决定数据宽度和转换延迟，不模拟舍入、溢出及误差。使用 Vector 精度的稠密 mask；不模拟片上生成或稀疏压缩的 mask，也不按被屏蔽元素减少计算。
+7. **范围**：完整有效 KV tile 的前向中间稳态，不覆盖首次初始化、最后不足整块、最终 O/LSE 输出、训练反向及多请求调度。实际读取 Q 仍计每 tile 的 Tensor L1 流量，Q 的 DDR 初始加载不计。
+8. **验证层级**：单元测试与独立资源扫描验证代码内的字节、区间、依赖和容量一致性；没有真实硬件测量校准。启发式找到的排程不应标为硬件最优。
+
+历史 520-cycle 排程考虑了当时所建模的 Vector/L1 带宽，但假定 A、mask 及其他本地中间数据可由足够的本地存储提供，没有计入它们的全部 L1 流量，也没有验证本地存储容量/带宽。当前资源下界仍可能为 520，这只是 EXP 等平均工作量的下界，不表示完整模型已经达到该吞吐。不同版本或参数实验必须同时引用输入配置、存储放置、II、是否达到下界和对应 report.json。
 

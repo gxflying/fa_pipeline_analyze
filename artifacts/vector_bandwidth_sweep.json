@@ -1,0 +1,134 @@
+[
+  {
+    "case": "base",
+    "read_gbps": 256,
+    "write_gbps": 256,
+    "ii": 1227,
+    "lower": 520,
+    "operations": {
+      "EXP_P": {
+        "start": 650,
+        "ready": 1165,
+        "occupancy": 512,
+        "overlap_exp": 512
+      },
+      "PV": {
+        "start": 1601,
+        "ready": 1873,
+        "occupancy": 256,
+        "overlap_exp": 0
+      },
+      "SCALE_A": {
+        "start": 2390,
+        "ready": 2520,
+        "occupancy": 128,
+        "overlap_exp": 0
+      },
+      "ADD_A": {
+        "start": 2520,
+        "ready": 2780,
+        "occupancy": 255,
+        "overlap_exp": 0
+      }
+    }
+  },
+  {
+    "case": "store2",
+    "read_gbps": 256,
+    "write_gbps": 512,
+    "ii": 751,
+    "lower": 520,
+    "operations": {
+      "EXP_P": {
+        "start": 650,
+        "ready": 1165,
+        "occupancy": 512,
+        "overlap_exp": 512
+      },
+      "PV": {
+        "start": 1165,
+        "ready": 1437,
+        "occupancy": 256,
+        "overlap_exp": 21
+      },
+      "SCALE_A": {
+        "start": 1437,
+        "ready": 1567,
+        "occupancy": 128,
+        "overlap_exp": 128
+      },
+      "ADD_A": {
+        "start": 1567,
+        "ready": 1827,
+        "occupancy": 255,
+        "overlap_exp": 255
+      }
+    }
+  },
+  {
+    "case": "load2",
+    "read_gbps": 512,
+    "write_gbps": 256,
+    "ii": 967,
+    "lower": 520,
+    "operations": {
+      "EXP_P": {
+        "start": 650,
+        "ready": 1165,
+        "occupancy": 512,
+        "overlap_exp": 512
+      },
+      "PV": {
+        "start": 1341,
+        "ready": 1613,
+        "occupancy": 256,
+        "overlap_exp": 0
+      },
+      "SCALE_A": {
+        "start": 2130,
+        "ready": 2260,
+        "occupancy": 128,
+        "overlap_exp": 0
+      },
+      "ADD_A": {
+        "start": 2455,
+        "ready": 2587,
+        "occupancy": 128,
+        "overlap_exp": 2
+      }
+    }
+  },
+  {
+    "case": "both2",
+    "read_gbps": 512,
+    "write_gbps": 512,
+    "ii": 582,
+    "lower": 520,
+    "operations": {
+      "EXP_P": {
+        "start": 650,
+        "ready": 1165,
+        "occupancy": 512,
+        "overlap_exp": 512
+      },
+      "PV": {
+        "start": 1538,
+        "ready": 1810,
+        "occupancy": 256,
+        "overlap_exp": 205
+      },
+      "SCALE_A": {
+        "start": 1810,
+        "ready": 1940,
+        "occupancy": 128,
+        "overlap_exp": 125
+      },
+      "ADD_A": {
+        "start": 1940,
+        "ready": 2072,
+        "occupancy": 128,
+        "overlap_exp": 128
+      }
+    }
+  }
+]

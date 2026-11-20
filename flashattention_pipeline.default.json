@@ -1,10 +1,12 @@
 {
   "shape": {"query_rows": 64, "kv_cols": 64, "head_dim_qk": 128, "head_dim_v": 128},
   "clock_ghz": 1.0,
+  "mask": {"source": "ddr", "dtype": "vector"},
   "dtype_bytes": {"q": 2, "k": 2, "v": 2, "s": 4, "p": 2, "y": 4, "state": 4, "o": 2},
   "tensor": {
     "micro_m": 4, "micro_k": 32, "micro_n": 16,
     "latency_cycles": 15,
+    "input_latency_cycles": 1, "output_latency_cycles": 1,
     "read_gbps": 256, "write_gbps": 256
   },
   "ddr": {"read_gbps": 200, "write_gbps": 200, "efficiency": 0.7},
