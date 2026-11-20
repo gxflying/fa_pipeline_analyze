@@ -59,6 +59,45 @@ NUMERIC_DEFAULTS = {
 }
 
 
+def parameter_caption(config):
+    """所有图共用的有效参数摘要；带宽是十进制 GB/s，不是 Gb/s。"""
+    f = config['clock_ghz']
+    sizes, formats = numeric_layout(config)
+    lines = [f"参数快照 | {f:g} GHz | shape {config['shape']} | L1 {config['l1']['size_kib']:g} KiB | 窗口 {config['plot']['periods']} periods"]
+    for group in ('vector', 'tensor', 'l1', 'ddr'):
+        spec = config[group]
+        efficiency = spec.get('efficiency', 1)
+        rates = ' / '.join(f"{spec[d+'_gbps']:g} GB/s → {spec[d+'_gbps']*efficiency/f:g} B/cycle" for d in ('read', 'write'))
+        lines.append(f"{group.upper()} 读 / 写容量: {rates}" + (f"；DDR efficiency={efficiency:g}（箭头后为有效值）" if group == 'ddr' else ''))
+    lines.append(f"有效数据字节数 {sizes}；格式 {formats or '由 dtype_bytes 指定'}；mask {config['mask']}")
+    lines.append(f"Tensor micro(M,K,N)=({config['tensor']['micro_m']},{config['tensor']['micro_k']},{config['tensor']['micro_n']})；计算延迟 {config['tensor']['latency_cycles']} c；" + '；'.join(f"{g} 输入/输出延迟 {config[g]['input_latency_cycles']}/{config[g]['output_latency_cycles']} c" for g in ('tensor', 'vector')))
+    lines.append('Vector 各类型一份；并行度/延迟(c): ' + ' | '.join(f"{k} {v['parallelism']}/{v['latency_cycles']}" for k,v in config['vector']['units'].items()))
+    lines.append(f"转换 {config.get('numeric', {}).get('conversion', '未启用 numeric')}；排程最大 II {config['scheduler']['max_ii_cycles']}；非活跃参数不会强制改变时序。")
+    return lines
+
+
+def save_parameterized_figure(fig, destination, config):
+    """追加独立参数区，保持原绘图区尺寸，避免挤压或遮盖已有标注。"""
+    import io
+    import matplotlib.pyplot as plt
+    from PIL import Image
+    dpi = config['plot']['dpi']
+    plot_buffer = io.BytesIO()
+    fig.savefig(plot_buffer, dpi=dpi)
+    lines = parameter_caption(config)
+    footer = plt.figure(figsize=(fig.get_figwidth(), 2.15), dpi=dpi)
+    for i, line in enumerate(lines):
+        footer.text(.02, .94-i*.105, line, va='top', fontsize=9)
+    footer_buffer = io.BytesIO()
+    footer.savefig(footer_buffer, dpi=dpi)
+    plt.close(footer)
+    plot_buffer.seek(0); footer_buffer.seek(0)
+    with Image.open(plot_buffer) as main, Image.open(footer_buffer) as tail:
+        combined = Image.new('RGB', (main.width, main.height+tail.height), 'white')
+        combined.paste(main, (0, 0)); combined.paste(tail, (0, main.height))
+        combined.save(destination)
+
+
 def validate_config(config):
     """严格核对键和值，避免拼写错误被静默忽略。"""
     template = json.loads(DEFAULT_CONFIG.read_text(encoding="utf-8"))
@@ -736,7 +775,7 @@ def draw_bandwidth_details(config, report, output_dir):
     fig.suptitle(f"L1 读写带宽及操作贡献 | 左读、右写，同一行对应同一时间区间 | II={ii} cycle",fontsize=22,y=.997)
     fig.text(.045,.987,"黑线及上方数字=总带宽；彩色层内数字=该操作贡献，单位 B/cycle；图例标明操作[tile偏移]。负偏移表示前序tile。总图第k周期时刻=此处坐标+k×II，tile编号也加k。",fontsize=12)
     path = output_dir/"bandwidth_detail.png"
-    fig.savefig(path,dpi=plot["dpi"]); plt.close(fig)
+    save_parameterized_figure(fig, path, config); plt.close(fig)
     return {"bandwidth_detail":path}
 
 
@@ -776,6 +815,9 @@ def make_report(config, operations, capacities, ii, lower_bound, total, pools):
     unit_times = {}
     for resource in capacities:
         unit_times[resource] = {
+            "capacity_per_cycle": capacities[resource],
+            "mean_demand_per_cycle": float(amounts[resource].mean()),
+            "capacity_utilization": float(amounts[resource].mean()/capacities[resource]),
             **timing(int(busy[resource].sum())),
             "issue_cycles_per_period": issued[resource],
             "peak_demand_per_cycle": float(amounts[resource].max()),
@@ -1035,7 +1077,7 @@ def draw_execution_overview(config, operations, report, destination):
                  fontsize=23, y=.97)
     fig.text(.055,.025,"mask 从 DDR 加载，A 在 L1 原地更新；容量数字为各槽池当前存活 KiB，固定预留另列。FP32 score scratch 另行核算，不属于 L1。稳态不含初始化与最终归一化。",
              fontsize=12)
-    fig.savefig(destination, dpi=plot["dpi"]); plt.close(fig)
+    save_parameterized_figure(fig, destination, config); plt.close(fig)
 
 
 def configure_plot_fonts():
@@ -1241,7 +1283,7 @@ def draw(config, operations, report, destination):
              f"\nmask 从DDR加载；A驻留L1。L1固定预留 {report['l1_reserved_bytes']/1024:g} KiB，存活峰值 {report['l1_capacity']['live_peak_bytes']/1024:g} KiB；带宽行 B/cycle，容量行 KiB。"
              "\n同号表示数据依赖允许并行。指数两支共用 EXP，实际发射时间以泳道为准。虚线表示结果延迟。", fontsize=10)
     # 明确指定像素尺寸，避免 bbox_inches='tight' 改变请求的全尺寸输出。
-    fig.savefig(destination, dpi=plot["dpi"])
+    save_parameterized_figure(fig, destination, config)
     plt.close(fig)
 
 
@@ -1284,7 +1326,11 @@ def draw_statistics(config, report, output_dir):
             bars = ax.barh(positions, times, height=0.55, color=busy_color)
         ax.bar_label(bars, labels=[f"{value:g} ns  ({value / window:.2%})" for value in times],
                      padding=7, fontsize=14)
-        ax.set_yticks(positions, units, fontsize=16)
+        labels = units if units is compute_units else [
+            f"{unit}\n上限 {report['units'][unit]['capacity_per_cycle']:g} B/c = "
+            f"{report['units'][unit]['capacity_per_cycle']*frequency:g} GB/s"
+            for unit in units]
+        ax.set_yticks(positions, labels, fontsize=12 if units is io_units else 16)
         ax.invert_yaxis()
         ax.set_xlim(0, window * 1.24)
         ax.axvline(window, color="#9ca9b5", linestyle="--", linewidth=1)
@@ -1300,7 +1346,7 @@ def draw_statistics(config, report, output_dir):
              "各单元可以并发，条形长度分别相对于同一个统计窗口。L1 接口按活动周期统计。",
              fontsize=16)
     units_path = output_dir / "unit_statistics.png"
-    fig.savefig(units_path, dpi=plot["dpi"])
+    save_parameterized_figure(fig, units_path, config)
     plt.close(fig)
 
     fig, ax = plt.subplots(figsize=figsize, dpi=plot["dpi"])
@@ -1334,7 +1380,7 @@ def draw_statistics(config, report, output_dir):
              "统计覆盖中间稳态，初始化、最终归一化和输出写回发生在窗口之外。",
              fontsize=17)
     engines_path = output_dir / "engine_statistics.png"
-    fig.savefig(engines_path, dpi=plot["dpi"])
+    save_parameterized_figure(fig, engines_path, config)
     plt.close(fig)
     return {"unit_statistics": units_path, "engine_statistics": engines_path}
 
@@ -1361,6 +1407,8 @@ def main():
     report["png"] = {"path": str(png.resolve()), "width_px": config["plot"]["width_px"],
                      "height_px": config["plot"]["height_px"]}
     from PIL import Image
+    with Image.open(png) as im:
+        report['png'].update(width_px=im.width, height_px=im.height)
     report["statistics_png"] = {}
     for name,path in statistics_paths.items():
         with Image.open(path) as im:

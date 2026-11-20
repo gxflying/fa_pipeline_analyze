@@ -7,6 +7,24 @@ import flashattention_pipeline as pipeline
 
 
 class PipelineTests(unittest.TestCase):
+    def test_parameter_caption_and_capacity_follow_frequency_and_interfaces(self):
+        config = json.loads(pipeline.DEFAULT_CONFIG.with_name('flashattention_pipeline.fp16_inline.json').read_text())
+        config['clock_ghz'] = 2.0
+        config['vector']['write_gbps'] = 512
+        config['l1']['write_gbps'] = 768
+        ops, caps, ii, lower, total, pools = pipeline.solve(config)
+        report = pipeline.make_report(config, ops, caps, ii, lower, total, pools)
+        self.assertEqual(caps['VECTOR_ST'], 256)
+        self.assertEqual(caps['L1_W'], 384)
+        self.assertEqual(report['units']['VECTOR_ST']['capacity_per_cycle'], 256)
+        self.assertAlmostEqual(report['units']['L1_W']['capacity_utilization'],
+                               report['units']['L1_W']['demand_per_period']/ii/384)
+        caption = '\n'.join(pipeline.parameter_caption(config))
+        self.assertIn('512 GB/s → 256 B/cycle', caption)
+        self.assertIn('768 GB/s → 384 B/cycle', caption)
+        self.assertIn('200 GB/s → 70 B/cycle', caption)
+        self.assertEqual(report['window_ns'], report['window_cycles']/2)
+
     def test_bandwidth_contributors_preserve_identity_and_cross_period_tiles(self):
         report = {"ii_cycles":4,"window_cycles":4,
                   "operations":[
