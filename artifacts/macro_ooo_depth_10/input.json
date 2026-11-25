@@ -1,0 +1,175 @@
+{
+  "shape": {
+    "query_rows": 64,
+    "kv_cols": 64,
+    "head_dim_qk": 128,
+    "head_dim_v": 128
+  },
+  "clock_ghz": 1.0,
+  "mask": {
+    "source": "ddr",
+    "dtype": "vector"
+  },
+  "dtype_bytes": {
+    "q": 2,
+    "k": 2,
+    "v": 2,
+    "s": 4,
+    "p": 2,
+    "y": 4,
+    "state": 4,
+    "o": 2
+  },
+  "numeric": {
+    "tensor_input_dtype": "fp16",
+    "tensor_output_dtype": "fp16",
+    "vector_dtype": "fp32",
+    "ddr_k_dtype": "tensor",
+    "ddr_v_dtype": "tensor",
+    "conversion": {
+      "mode": "inline",
+      "vector_load_extra_cycles": 2,
+      "vector_store_extra_cycles": 2,
+      "dma_extra_cycles": 2
+    }
+  },
+  "tensor": {
+    "micro_m": 4,
+    "micro_k": 32,
+    "micro_n": 16,
+    "latency_cycles": 15,
+    "input_latency_cycles": 1,
+    "output_latency_cycles": 1,
+    "read_gbps": 256,
+    "write_gbps": 256
+  },
+  "ddr": {
+    "read_gbps": 200,
+    "write_gbps": 200,
+    "efficiency": 0.7
+  },
+  "l1": {
+    "size_kib": 512,
+    "read_gbps": 512,
+    "write_gbps": 512
+  },
+  "vector": {
+    "input_latency_cycles": 1,
+    "output_latency_cycles": 1,
+    "units": {
+      "MUL": {
+        "parallelism": 64,
+        "latency_cycles": 1
+      },
+      "ADD": {
+        "parallelism": 64,
+        "latency_cycles": 1
+      },
+      "SUB": {
+        "parallelism": 64,
+        "latency_cycles": 1
+      },
+      "MAX": {
+        "parallelism": 64,
+        "latency_cycles": 1
+      },
+      "CVT": {
+        "parallelism": 64,
+        "latency_cycles": 1
+      },
+      "EXP": {
+        "parallelism": 8,
+        "latency_cycles": 1
+      },
+      "DIV": {
+        "parallelism": 8,
+        "latency_cycles": 1
+      },
+      "RCP": {
+        "parallelism": 8,
+        "latency_cycles": 1
+      },
+      "SQRT": {
+        "parallelism": 8,
+        "latency_cycles": 1
+      },
+      "REDMAX": {
+        "parallelism": 64,
+        "latency_cycles": 1
+      },
+      "REDSUM": {
+        "parallelism": 64,
+        "latency_cycles": 1
+      }
+    },
+    "read_port_gbps": 256,
+    "write_port_gbps": 256,
+    "read_ports": 1,
+    "write_ports": 2
+  },
+  "scheduler": {
+    "max_ii_cycles": 10000
+  },
+  "plot": {
+    "periods": 4,
+    "width_px": 7200,
+    "height_px": 2400,
+    "dpi": 160,
+    "show_hidden_vector_io": false
+  },
+  "vector_detail": {
+    "group_size": 4,
+    "register": {
+      "elements": 64,
+      "dtype": "fp32",
+      "capacity_registers": null,
+      "read_ports": null,
+      "write_ports": null
+    },
+    "forwarding": true,
+    "writeback_delay_cycles": 1,
+    "queue_depth": 8,
+    "dispatch_width": 1,
+    "branch_latency_cycles": 1,
+    "tiles": 12,
+    "max_cycles": 200000,
+    "fusion_regions": [
+      [
+        "SCALE",
+        "MASK",
+        "ROWMAX",
+        "MAX",
+        "SUB_S",
+        "DELTA",
+        "EXP_P",
+        "ALPHA",
+        "ROWSUM"
+      ],
+      [
+        "SCALE_L",
+        "ADD_L"
+      ],
+      [
+        "SCALE_A",
+        "ADD_A"
+      ]
+    ]
+  },
+  "macro_scheduler": {
+    "frontend_dispatch_width": 1,
+    "queues": {
+      "Tensor": {
+        "entries": 10,
+        "policy": "ooo"
+      },
+      "Vector": {
+        "entries": 10,
+        "policy": "ooo"
+      },
+      "DMA": {
+        "entries": 10,
+        "policy": "ooo"
+      }
+    }
+  }
+}

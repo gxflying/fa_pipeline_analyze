@@ -1519,9 +1519,11 @@ class DetailProgram:
                     "load A":"SCALE_A", "load Y":"ADD_A", "store A":"ADD_A",
                     "store P":"EXP_P"}.get(label,label))
         shape=self.config["shape"]
+        state_bytes=FORMAT_BYTES[self.detail['register']['dtype']]
         sizes={"K":shape["kv_cols"]*shape["head_dim_qk"]*2,
                "V":shape["kv_cols"]*shape["head_dim_v"]*2,
-               "mask":shape["query_rows"]*shape["kv_cols"]*4,
+               "mask":shape["query_rows"]*shape["kv_cols"]*state_bytes,
+               "newS":shape["query_rows"]*shape["kv_cols"]*state_bytes,
                "S":shape["query_rows"]*shape["kv_cols"]*2,
                "P":shape["query_rows"]*shape["kv_cols"]*2,
                "Y":shape["query_rows"]*shape["head_dim_v"]*2}
@@ -1529,6 +1531,8 @@ class DetailProgram:
         if unit=="DMA_RD" and label=="load mask": produces[label]="mask"
         consumes={"QK":["K"],"PV":["P","V"],"load score":["S"],"load Y":["Y"]}
         if unit=="LD" and label=="load mask": consumes[label]=["mask"]
+        if label=="store scaled score": produces[label]="newS"
+        if label=="load scaled score": consumes[label]=["newS"]
         alloc=[]; uses=[]
         if label in produces:
             name=f"{tile}:{produces[label]}"; self.l1_sizes[name]=sizes[produces[label]]; alloc=[name]
@@ -1544,6 +1548,8 @@ class DetailProgram:
 
     def region(self, op):
         region=next((i for i,r in enumerate(self.detail["fusion_regions"]) if op in r), op)
+        if self.detail['register']['dtype']=='fp16':
+            return region
         return vector_phase(op),region
 
     def materialize(self, refs, consumer, tile):
@@ -1575,6 +1581,9 @@ class DetailProgram:
 
 
 def detail_program(config):
+    if config['vector_detail']['register']['dtype']=='fp16':
+        from packed_attention import compile_packed
+        return compile_packed(config,DetailProgram(config),make_model(config)[0])
     p = DetailProgram(config)
     d = p.detail
     m,n,dk,dv = [config["shape"][k] for k in ("query_rows","kv_cols","head_dim_qk","head_dim_v")]
@@ -1661,10 +1670,13 @@ class DetailSimulator:
         self.queues=defaultdict(deque); self.cursor={}; self.collected={}
         self.references=Counter(r for i in program.instructions for s in i["sources"] for r in s)
         self.alloc={}; self.pending=defaultdict(int); self.allocated_series=[]
+        self.current_cycle=0
+        self.register_lifetimes={}
         self.pc=0; self.blocked=None; self.stalls=Counter(); self.dispatch={}
         self.ref_reads=Counter(); self.forwarded=Counter()
+        self.lane_wb=defaultdict(dict)
         sh=self.c["shape"]
-        self.l1_resident=sh["query_rows"]*(sh["head_dim_qk"]*2+sh["head_dim_v"]*4)
+        self.l1_resident=sh["query_rows"]*(sh["head_dim_qk"]*2+sh["head_dim_v"]*FORMAT_BYTES[self.d['register']['dtype']])
         self.l1_live={}; self.l1_history={}; self.l1_finished={}
         self.l1_refs=Counter(x for i in program.instructions for x in i["l1_use"])
         self.l1_producers=Counter(x for i in program.instructions for x in i["l1_allocate"])
@@ -1709,6 +1721,10 @@ class DetailSimulator:
         while any(r in occupied for r in range(base,base+size)): base+=size
         if limit is not None and base+size>limit: return False
         self.alloc[name]=(base,size)
+        if name in self.register_lifetimes:
+            raise AssertionError('同一数据版本在释放后再次被分配')
+        self.register_lifetimes[name]=dict(allocate=self.current_cycle,release=None,base=base,count=size,
+            operation=self.p.values[name]['op'],tile=self.p.values[name]['tile'])
         return True
 
     def release(self,t):
@@ -1719,6 +1735,7 @@ class DetailSimulator:
             if self.p.values[name].get("retain_final"): continue
             refs=[(name,k) for k in range(self.p.values[name]["count"])]
             if all(r in self.wb and self.wb[r]<=t and self.references[r]==0 for r in refs):
+                self.register_lifetimes[name]['release']=t
                 del self.alloc[name]
 
     def step_instruction(self,i,t):
@@ -1731,7 +1748,8 @@ class DetailSimulator:
                     if v: req[resource,t+dt]+=float(v)
             if not self.can(req) or not self.l1_accept(i,t): return False
             self.reserve(req); end=t+op.ready_offset
-            self.events.append(dict(instruction=i["id"],tile=i["tile"],unit=i["unit"],label=i["label"],start=t,end=end,result=end,writeback=None,register=None))
+            self.events.append(dict(instruction=i["id"],tile=i["tile"],unit=i["unit"],label=i["label"],start=t,end=end,result=end,writeback=None,register=None,
+                activity_intervals=[(t+a,t+b) for a,b,_ in op.runs(i['unit'])]))
             self.complete(i,end)
             return True
         if i["unit"]=="BR":
@@ -1744,17 +1762,30 @@ class DetailSimulator:
         if dest and not self.allocate(dest[0]): self.stalls["register_capacity"]+=1; return False
         captured=self.collected.setdefault((i["id"],idx),{})
         for operand,r in enumerate(src):
-            if operand in captured: continue
+            if operand in captured and captured[operand].get('complete',True): continue
+            lanes=self.p.values[r[0]].get('lane_count',0)
+            if lanes and (len(self.lane_wb[r])<lanes or max(self.lane_wb[r].values())>t):
+                continue
             if self.ready.get(r,float("inf"))>t: continue
             fwd=self.d["forwarding"] and t<self.wb[r]
             if not fwd and self.wb[r]>t: continue
             if not fwd and not self.can({("RF_R",t):1}): self.stalls["RF_read_ports"]+=1; continue
-            if not fwd: self.reserve({("RF_R",t):1})
+            words=self.p.values[r[0]].get('words',1)
+            if not fwd:
+                part=captured.get(operand,{}).get('words_read',0)
+                remaining=words-part
+                cap=self.cap['RF_R']
+                take=remaining if cap is None else min(remaining,int(cap-self.used['RF_R'][t]))
+                self.reserve({("RF_R",t):take})
+                if part+take<words:
+                    captured[operand]=dict(complete=False,words_read=part+take)
+                    self.ref_reads[t]+=take
+                    continue
             else: self.forwarded[t]+=1
-            self.ref_reads[t]+=1
+            self.ref_reads[t]+=take if not fwd else words
             captured[operand]=dict(ref=r,cycle=t,path="forward" if fwd else "RF")
             self.references[r]-=1
-        if len(captured)!=len(src): return False
+        if len(captured)!=len(src) or any(not s.get('complete',True) for s in captured.values()): return False
         unit=i["unit"]; req=Counter()
         ref=dest or src[0]
         elements=self.p.values[ref[0]]["elements"][ref[1]]
@@ -1764,7 +1795,9 @@ class DetailSimulator:
             direction="read" if unit=="LD" else "write"
             port=self.c["vector"][direction+"_port_gbps"]/self.c["clock_ghz"]
             size=elements*i["width"]; beats=math.ceil(size/port)
-            extra=self.c["numeric"]["conversion"]["vector_load_extra_cycles" if unit=="LD" else "vector_store_extra_cycles"] if i["width"]!=4 else 0
+            native=FORMAT_BYTES[self.d['register']['dtype']]
+            converted=i['width']!=native or (unit=='ST' and self.p.values[src[0][0]].get('words',1)>1)
+            extra=self.c["numeric"]["conversion"]["vector_load_extra_cycles" if unit=="LD" else "vector_store_extra_cycles"] if converted else 0
             latency=self.c["vector"]["input_latency_cycles" if unit=="LD" else "output_latency_cycles"]
             offset=extra+latency-1 if unit=="ST" else 0
             for b in range(beats):
@@ -1780,14 +1813,25 @@ class DetailSimulator:
             result=t+batches-1+spec["latency_cycles"]
             issue_end=t+batches
         writeback=result+self.d["writeback_delay_cycles"] if dest else None
-        if dest: req["RF_W",writeback]+=1
+        words=self.p.values[dest[0]].get('words',1) if dest else 0
+        if dest:
+            cap=self.cap['RF_W'] or words
+            for w in range(words): req['RF_W',writeback+w//cap]+=1
         if not self.can(req): self.stalls["unit_bus_or_writeback"]+=1; return False
         if not self.l1_accept(i,t): return False
         self.reserve(req)
-        if dest: self.ready[dest]=result; self.wb[dest]=writeback
+        if dest: self.ready[dest]=result; self.wb[dest]=writeback+(words-1)//cap
+        if 'lane_start' in i:
+            lane=i['lane_start']+idx
+            if lane in self.lane_wb[dest]: raise AssertionError('归约重复写入同一版本的 lane')
+            self.lane_wb[dest][lane]=writeback
         self.events.append(dict(instruction=i["id"],tile=i["tile"],unit=unit,label=i["label"],start=t,end=issue_end,
-            result=result,writeback=writeback,register=(self.alloc[dest[0]][0]+dest[1] if dest else None),
+            result=result,writeback=writeback,writeback_complete=self.wb.get(dest),
+            register=(self.alloc[dest[0]][0]+dest[1]*words if dest else None),
+            destination_lane=i['lane_start']+idx if 'lane_start' in i else None,
+            broadcast_lane=i['broadcast_start']+idx if 'broadcast_start' in i else None,
             destination=dest,sources=list(captured.values()),elements=elements))
+        self.events[-1]['activity_intervals']=[(t+offset if unit=='ST' else t,issue_end)]
         self.cursor[i["id"]]=idx+1
         total=max(len(i["sources"]),len(i["destinations"]))
         if idx+1==total:
@@ -1798,6 +1842,7 @@ class DetailSimulator:
     def run(self):
         instructions=self.p.instructions
         for t in range(self.d["max_cycles"]):
+            self.current_cycle=t
             self.release(t)
             if self.blocked is not None and self.done.get(self.blocked,float("inf"))<=t: self.blocked=None
             for _ in range(self.d["dispatch_width"]):
@@ -1925,7 +1970,7 @@ def macro_program(config):
             for pos,n in enumerate(m['body']):
                 body.append(n)
                 row=p.instructions[n]['row']
-                if pos+1==len(m['body']) or p.instructions[m['body'][pos+1]]['row']!=row:
+                if row>=0 and (pos+1==len(m['body']) or p.instructions[m['body'][pos+1]]['row']!=row):
                     p.current_row=row
                     body.append(p.emit('BR','macro row loop',tile=m['tile'],owner_op='BR'))
             m['body']=body
@@ -1952,6 +1997,15 @@ class MacroSimulator(DetailSimulator):
         self.l1_pool_high=Counter()
         self.last_activity=0
         self.rf_admission_cache={}
+        self.register_macro_boundaries=[]
+        self.cross_macro_registers=[]
+        writers={r:self.p.macro_of[i['id']] for i in self.p.instructions for r in i['destinations']}
+        self.cross_macro_values={name for name,spec in self.p.values.items()
+                                 if spec.get('initial') or spec.get('retain_final')}
+        for i in self.p.instructions:
+            for operands in i['sources']:
+                for ref in operands:
+                    if writers.get(ref)!=self.p.macro_of[i['id']]: self.cross_macro_values.add(ref[0])
 
     def l1_accept(self,i,t):
         # 每类独立槽池保留已达到的容量高水位，避免不同类型峰值错峰被错误复用。
@@ -2061,12 +2115,20 @@ class MacroSimulator(DetailSimulator):
 
     def run(self):
         for t in range(self.d['max_cycles']):
+            self.current_cycle=t
             self.release(t)
             for engine,ctx in self.active.items():
                 if ctx is not None and ctx['drain'] is not None and ctx['drain']<=t:
                     mid=ctx['mid']; self.finished[mid]=t; self.mrecords[mid]['end']=t
                     self.active[engine]=None; self.last_activity=t
-                    if engine=='Vector': self.rf_admission_cache.clear()
+                    if engine=='Vector':
+                        self.rf_admission_cache.clear()
+                        temporary=set(self.alloc)-self.cross_macro_values
+                        if temporary: raise AssertionError(f'宏完成后仍有临时寄存器未释放：{temporary}')
+                        self.register_macro_boundaries.append(dict(macro=mid,cycle=t,
+                            live_values=[dict(value=name,base=base,count=count,operation=self.p.values[name]['op'])
+                                         for name,(base,count) in self.alloc.items()],
+                            live_registers=sum(count for _,count in self.alloc.values())))
             # 已入队宏可以在本拍发射并立即释放 entry；本拍新入队也允许被空闲引擎接受。
             engines=self.ENGINES[t%3:]+self.ENGINES[:t%3]
             for engine in engines: self.try_start(engine,t)
@@ -2082,6 +2144,8 @@ class MacroSimulator(DetailSimulator):
             self.vector_cycle(t)
             if len(self.events)!=previous: self.last_activity=t
             self.allocated_series.append(sum(n for _,n in self.alloc.values()))
+            self.cross_macro_registers.append(sum(count for name,(_,count) in self.alloc.items()
+                                                 if name in self.cross_macro_values))
             for engine in self.ENGINES:
                 self.queue_history[engine].append(dict(queued=len(self.mqueues[engine]),active=int(self.active[engine] is not None)))
             if len(self.finished)==len(self.p.macros):
@@ -2116,9 +2180,20 @@ class MacroSimulator(DetailSimulator):
         report['observed_period_tiles']=period
         report['observed_mean_II']=sum(intervals[-period:])/period if period else None
         report['resource_capacities']=self.cap
+        report['register_lifetimes']=self.register_lifetimes
+        report['register_macro_boundaries']=self.register_macro_boundaries
+        report['cross_macro_registers']=self.cross_macro_registers
+        from detail_plotting import select_steady_window
+        report['steady_window']=select_steady_window(report)
         report['scope']+=['全局每 cycle 入队一条宏；队满反压前端；每引擎至多执行一个宏。',
                           '宏完成包括 RF 写回与 L1 输出可见；任何消费者均等待生产宏整体完成。',
                           '默认 EXP_P 与 ROWSUM 融合；仅 FP16 P 出 L1，z、m、alpha、ell 以 FP32 vreg 跨宏传递。']
+        if self.d['register']['dtype']=='fp16':
+            report['register_state_layout']='每行一个 FP16 lane；每个 m、ℓ、r、z、α 的版本为一个 128 B vreg。'
+            report['scope']=[s for s in report['scope'] if '每行 m/l' not in s and 'FP32 vreg' not in s and '逐行 strip' not in s]
+            report['scope'] += [report['register_state_layout'],'两个 score 宏通过 FP16 S 在 L1 交付；SUB_S/EXP_P 与 DELTA/ALPHA 分属不同宏。',
+                                '整向量消费者等待所有归约 lane 写回；广播取状态向量对应行。每次部分写占一写口。',
+                                'MUL 产生 FP32，依赖端显式 CVT；Tensor 写回的 FP16 窄化增加配置的输出延迟。']
         return report
 
 
@@ -2157,66 +2232,11 @@ def draw_detail(report, output, page=0):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    from detail_plotting import draw_vector_period, draw_execution_timeline
     configure_plot_fonts()
-    events=report["events"]; end=report["cycles"]
-    # 细图采用末 tile 的首 180 cycle，保持单元格可辨；完整轨迹另图呈现。
-    tile=max(0,max(e["tile"] for e in events)-1)
-    origin=min(e["start"] for e in events if e["tile"]==tile and e["unit"]=="LD")
-    period=report.get('observed_period_tiles') or 1
-    window=sum(report['tile_intervals'][-period:]) if report['tile_intervals'] else end-origin
-    window=min(window,end-origin)
-    begin=origin+page*180
-    stop=min(end,origin+window,begin+180)
-    visible=[e for e in events if e["start"]<stop and e["end"]>begin and e["unit"] not in ("DMA_RD","TENSOR")]
-    ids=list(dict.fromkeys((e["unit"],e["label"]) for e in visible))
-    fig,axes=plt.subplots(6,1,figsize=(24,max(12,len(ids)*.24+6)),sharex=True,
-        gridspec_kw={"height_ratios":[max(4,len(ids)*.24),1,1,1,1,1]})
-    positions={v:k for k,v in enumerate(ids)}
-    for ev in visible:
-        y=positions[ev['unit'],ev['label']]; color=plt.cm.tab20(ev.get('row',ev['tile'])%20)
-        axes[0].barh(y,ev["end"]-ev["start"],left=ev["start"],height=.7,color=color,edgecolor="black",linewidth=.4)
-        if ev.get("register") is not None:
-            axes[0].text(ev["start"],y,f"v{ev['register']}",fontsize=7,va="center")
-        axes[0].plot(ev["result"],y,"v",ms=3,color="green")
-        if ev["writeback"] is not None: axes[0].plot(ev["writeback"],y,"|",ms=6,color="red")
-    ticklabels=[]
-    for k in ids:
-        label=k[1]
-        equation=ATTENTION_EQUATIONS.get(label)
-        ticklabels.append(k[0]+": "+(f"${equation}$" if equation else label))
-    axes[0].set_yticks(range(len(ids)),ticklabels,fontsize=8)
-    axes[0].invert_yaxis(); axes[0].set_title("Vector 细粒度轨迹：方块=输入占用；绿三角=结果可转发；红线=RF 写回")
-    series=[report["allocated_registers"],report["source_operand_requests"],report["resources"].get("RF_R",{}),report["resources"].get("RF_W",{}),report["forwarding"]]
-    labels=["已分配 vreg","源操作数需求","实际 RF 读口","RF 写口","forward 次数"]
-    for ax,values,label in zip(axes[1:],series,labels):
-        x=np.arange(begin,stop); y=[values[t] if isinstance(values,list) else values.get(t,0) for t in x]
-        ax.step(x,y,where="post"); ax.set_ylabel(label); ax.grid(alpha=.25)
-    reg=report['config']['vector_detail']['register']
-    for ax,cap in ((axes[1],reg['capacity_registers']),(axes[3],reg['read_ports']),(axes[4],reg['write_ports'])):
-        if cap is not None: ax.axhline(cap,color='red',linestyle='--')
-    axes[1].set_title(f"每 vreg {reg['elements']*4} B；全程分配峰值 {report['peak_registers']} vreg / {report['peak_registers']*reg['elements']*4/1024:g} KiB",fontsize=9)
-    axes[-1].set_xlabel("cycle"); axes[-1].set_xlim(begin,stop)
-    fig.tight_layout(); fig.savefig(output/("vector_detail.png" if page==0 else f"vector_detail_{page+1:02d}.png"),dpi=160); plt.close(fig)
-    if page: return
-    for next_page in range(1,math.ceil(window/180)): draw_detail(report,output,next_page)
+    draw_vector_period(report,output,ATTENTION_EQUATIONS)
+    draw_execution_timeline(report,output,ATTENTION_EQUATIONS,VECTOR_UNITS)
     lanes=["DMA_RD","TENSOR","LD",*VECTOR_UNITS,"ST","BR"]
-    fig,axes=plt.subplots(5,1,figsize=(28,14),sharex=True,gridspec_kw={"height_ratios":[8,1,1,1,1]})
-    for r in lanes:
-        vals=report["resources"].get(r,{})
-        active=sorted(t for t,v in vals.items() if v)
-        if active:
-            starts=[active[0]]; ends=[]
-            for a,b in zip(active,active[1:]):
-                if b!=a+1: ends.append(a+1); starts.append(b)
-            ends.append(active[-1]+1)
-            axes[0].broken_barh([(a,b-a) for a,b in zip(starts,ends)],(lanes.index(r)-.35,.7))
-    axes[0].set_yticks(range(len(lanes)),lanes); axes[0].invert_yaxis()
-    axes[0].set_title(f"完整执行轨迹；观测 tile 间隔={report['tile_intervals']}；包含填充/排空")
-    for ax,r,cap in zip(axes[1:],["L1_R","L1_W","L1_R_BUS","L1_W_BUS"],[None,None,report['config']['l1']['read_gbps']/report['config']['clock_ghz'],report['config']['l1']['write_gbps']/report['config']['clock_ghz']]):
-        vals=report["resources"].get(r,{})
-        ax.plot([vals.get(t,0)*(100/cap if cap else 1) for t in range(end)],linewidth=.5)
-        ax.set_ylabel(r+(" %" if cap else " B/c")); ax.grid(alpha=.2)
-    axes[-1].set_xlabel("cycle"); fig.tight_layout(); fig.savefig(output/"pipeline.png",dpi=160); plt.close(fig)
     fig,ax=plt.subplots(figsize=(10,5)); names=list(report["engine_busy_cycles"])
     bars=ax.bar(names,[report["engine_busy_cycles"][n] for n in names]); ax.bar_label(bars)
     ax.set_ylabel("输入占用区间并集 / cycle"); ax.set_title("DMA / Tensor / Vector（含控制与访存）")
@@ -2246,9 +2266,11 @@ def draw_macro_report(report,output):
         operations=sorted(dict.fromkeys(m['operations']),key=lambda op:steps.get(op,99))
         lines=[f"tile {m['tile']}"]
         for op in operations:
-            if op in ATTENTION_EQUATIONS:
+            if m['engine']!='DMA' and op in ATTENTION_EQUATIONS:
                 prefix=f"[{steps[op]}]\\ " if op in steps else ''
                 lines.append('$'+prefix+ATTENTION_EQUATIONS[op]+'$')
+                if report['config']['vector_detail']['register']['dtype']=='fp16' and op in ('SCALE','SCALE_A','SCALE_L'):
+                    lines.append('CAST FP32 → FP16')
             else:
                 lines.append(m['label'] if m['engine']=='DMA' else op)
         text=axes[0].text((m['start']+m['end'])/2,row,'\n'.join(lines),ha='center',va='center',fontsize=9,linespacing=1.3,clip_on=True)
@@ -2317,8 +2339,11 @@ def validate_detail(config):
     for key in ("capacity_registers","read_ports","write_ports"):
         v=d["register"][key]
         if v is not None and (not isinstance(v,int) or isinstance(v,bool) or v<1): raise ValueError(key+" 必须为正整数或 null")
-    if d["register"]["dtype"]!="fp32" or d["register"]["elements"]<1: raise ValueError("Vector 寄存器要求 FP32、正元素数")
-    if any(c["numeric"][key]!=value for key,value in [("tensor_input_dtype","fp16"),("tensor_output_dtype","fp16"),("vector_dtype","fp32")]) or c["numeric"]["conversion"]["mode"]!="inline":
+    dtype=d["register"]["dtype"]
+    if dtype not in ("fp16","fp32") or d["register"]["elements"]<1: raise ValueError("Vector 寄存器要求 FP16/FP32、正元素数")
+    if dtype=="fp16" and (type(d.get("tensor_store_cast_cycles")) is not int or d["tensor_store_cast_cycles"]<0):
+        raise ValueError("tensor_store_cast_cycles 必须为非负整数")
+    if any(c["numeric"][key]!=value for key,value in [("tensor_input_dtype","fp16"),("tensor_output_dtype","fp16"),("vector_dtype",dtype)]) or c["numeric"]["conversion"]["mode"]!="inline":
         raise ValueError("新后端要求 Tensor FP16、Vector FP32、inline conversion")
     flattened=[op for region in d["fusion_regions"] for op in region]
     if len(flattened)!=len(set(flattened)): raise ValueError("融合区域不可重复包含同一操作")
